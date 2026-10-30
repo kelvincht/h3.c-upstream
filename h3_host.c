@@ -114,6 +114,22 @@ int h3_reference_video_canvas(int width, int height,
     return 1;
 }
 
+static double h3_env_shift(const char *name, double fallback) {
+    const char *value = getenv(name);
+    if (!value || !*value) return fallback;
+    char *end = NULL;
+    double shift = strtod(value, &end);
+    return (end && *end == '\0' && shift > 0.0) ? shift : fallback;
+}
+
+double h3_video_sigma_shift(void) {
+    return h3_env_shift("H3_VIDEO_SHIFT", H3_VIDEO_SIGMA_SHIFT);
+}
+
+double h3_audio_sigma_shift(void) {
+    return h3_env_shift("H3_AUDIO_SHIFT", H3_AUDIO_SIGMA_SHIFT);
+}
+
 double h3_time_shift_sigma(double sigma, double from_shift, double to_shift) {
     double base = sigma / (from_shift + sigma * (1.0 - from_shift));
     return to_shift * base / (1.0 + (to_shift - 1.0) * base);
@@ -138,9 +154,9 @@ int h3_schedule_build(int steps, h3_sigma_schedule *schedule) {
     schedule->steps = steps;
     for (int index = 0; index < steps; index++) {
         schedule->video[index] = h3_shifted_sigma(
-            index, steps, (float)H3_VIDEO_SIGMA_SHIFT);
+            index, steps, (float)h3_video_sigma_shift());
         schedule->audio[index] = h3_shifted_sigma(
-            index, steps, (float)H3_AUDIO_SIGMA_SHIFT);
+            index, steps, (float)h3_audio_sigma_shift());
     }
     schedule->video[steps] = 0.0f;
     schedule->audio[steps] = 0.0f;
@@ -154,10 +170,10 @@ int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
     float denominator = (float)evaluations;
     for (int index = 0; index <= evaluations; index++) {
         float base = 1.0f - (float)index / denominator;
-        schedule->video[index] = (float)H3_VIDEO_SIGMA_SHIFT * base /
-            (1.0f + ((float)H3_VIDEO_SIGMA_SHIFT - 1.0f) * base);
-        schedule->audio[index] = (float)H3_AUDIO_SIGMA_SHIFT * base /
-            (1.0f + ((float)H3_AUDIO_SIGMA_SHIFT - 1.0f) * base);
+        schedule->video[index] = (float)h3_video_sigma_shift() * base /
+            (1.0f + ((float)h3_video_sigma_shift() - 1.0f) * base);
+        schedule->audio[index] = (float)h3_audio_sigma_shift() * base /
+            (1.0f + ((float)h3_audio_sigma_shift() - 1.0f) * base);
     }
     schedule->video[evaluations] = 0.0f;
     schedule->audio[evaluations] = 0.0f;

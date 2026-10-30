@@ -109,6 +109,10 @@ int h3_reference_image_canvas(int width, int height,
 int h3_reference_video_canvas(int width, int height,
                               int *adapted_w, int *adapted_h);
 
+/* H3_VIDEO_SHIFT / H3_AUDIO_SHIFT override the released 12 / 3: the 768p
+ * Turbo LoRAs were distilled at video shift 6. */
+double h3_video_sigma_shift(void);
+double h3_audio_sigma_shift(void);
 double h3_time_shift_sigma(double sigma, double from_shift, double to_shift);
 double h3_time_shift_slope(double sigma, double from_shift, double to_shift);
 int h3_schedule_build(int steps, h3_sigma_schedule *schedule);
