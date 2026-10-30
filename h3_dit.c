@@ -70,6 +70,8 @@ typedef struct {
 struct h3_dit {
     h3_gpu *gpu;
     h3_weight_store *weights;
+    char *weight_directory;
+    int core_adopted;
     h3_dit_schedule *schedule;
     int fused_mlp;
     int nax_mlp;
@@ -1556,6 +1558,117 @@ static void schedule_report(int completed, int total, void *opaque) {
     report(state->callback, state->opaque, "precompute AdaLN", completed, total);
 }
 
+static void free_step_maps(h3_dit *dit) {
+    int steps = h3_dit_schedule_steps(dit->schedule);
+    h3_gpu_tensor **maps[] = {dit->row_maps, dit->reduced_row_maps,
+                              dit->final_audio_maps, dit->final_video_maps};
+    for (unsigned kind = 0; kind < 4; kind++) {
+        if (maps[kind]) for (int step = 0; step < steps; step++)
+            h3_gpu_tensor_free(maps[kind][step]);
+        free(maps[kind]);
+    }
+    dit->row_maps = dit->reduced_row_maps = NULL;
+    dit->final_audio_maps = dit->final_video_maps = NULL;
+}
+
+/* Resident weights of a released prepared DiT, kept for the next load of the
+ * same checkpoint: re-conditioning on a new prompt or shape then skips the
+ * int8 core upload. Single owner, like the rest of the h3 context. */
+static h3_dit *retained_core;
+
+void h3_dit_retain_core(h3_dit *dit) {
+    if (!dit) return;  /* repeated clears keep what an earlier one retained */
+    h3_dit_release_core();
+    if (dit->ssd_streaming) {
+        h3_dit_free(dit);
+        return;
+    }
+    h3_dit *core = calloc(1, sizeof(*core));
+    if (!core) {
+        h3_dit_free(dit);
+        return;
+    }
+#define MOVE(field) do { core->field = dit->field; dit->field = NULL; } while (0)
+    MOVE(gpu); MOVE(weights); MOVE(weight_directory);
+    MOVE(video_patch_w); MOVE(video_patch_b);
+    MOVE(audio_patch_w); MOVE(audio_patch_b);
+    MOVE(final_norm); MOVE(final_video_w); MOVE(final_video_b);
+    MOVE(final_audio_w); MOVE(final_audio_b);
+#undef MOVE
+    memcpy(core->blocks, dit->blocks, sizeof(core->blocks));
+    memset(dit->blocks, 0, sizeof(dit->blocks));
+    memcpy(core->block_active, dit->block_active, sizeof(core->block_active));
+    core->fused_mlp = dit->fused_mlp;
+    core->nax_mlp = dit->nax_mlp;
+    core->int8_mlp = dit->int8_mlp;
+    core->int8_qkv = dit->int8_qkv;
+    core->int8_attention_out = dit->int8_attention_out;
+    core->keep_bf16_mlp = dit->keep_bf16_mlp;
+    core->keep_bf16_qkv = dit->keep_bf16_qkv;
+    core->keep_bf16_attention_out = dit->keep_bf16_attention_out;
+    core->use_int8_row_fc2 = dit->use_int8_row_fc2;
+    core->use_slower_grouped_quantizer = dit->use_slower_grouped_quantizer;
+    core->bf16_final = dit->bf16_final;
+    free_step_maps(dit);  /* sized by the schedule that moves below */
+    core->schedule = dit->schedule;
+    dit->schedule = NULL;
+    core->sigmas = dit->sigmas;
+    core->active_block_count = dit->active_block_count;
+    core->video_condition_rows = dit->video_condition_rows != 0;
+    core->audio_condition_rows = dit->audio_condition_rows != 0;
+    h3_dit_free(dit);
+    retained_core = core;
+}
+
+void h3_dit_release_core(void) {
+    h3_dit_free(retained_core);
+    retained_core = NULL;
+}
+
+/* The AdaLN schedule depends on the checkpoint, the sigmas and which
+ * condition streams exist; pruned (layer-thinned) schedules are not shared. */
+static int schedule_matches(const h3_dit *dit, const h3_dit *core) {
+    const h3_sigma_schedule *a = &dit->sigmas, *b = &core->sigmas;
+    size_t points = (size_t)a->steps + 1;
+    return core->schedule && a->steps == b->steps &&
+           dit->active_block_count == H3_DIT_BLOCKS &&
+           core->active_block_count == H3_DIT_BLOCKS &&
+           !memcmp(a->video, b->video, points * sizeof(*a->video)) &&
+           !memcmp(a->audio, b->audio, points * sizeof(*a->audio)) &&
+           (dit->video_condition_rows != 0) == core->video_condition_rows &&
+           (dit->audio_condition_rows != 0) == core->audio_condition_rows;
+}
+
+/* Everything load_core's output depends on besides the checkpoint path. */
+static int core_matches(const h3_dit *dit, const h3_dit *core) {
+    return !memcmp(dit->block_active, core->block_active,
+                   sizeof(dit->block_active)) &&
+           dit->fused_mlp == core->fused_mlp &&
+           dit->nax_mlp == core->nax_mlp &&
+           dit->int8_mlp == core->int8_mlp &&
+           dit->int8_qkv == core->int8_qkv &&
+           dit->int8_attention_out == core->int8_attention_out &&
+           dit->keep_bf16_mlp == core->keep_bf16_mlp &&
+           dit->keep_bf16_qkv == core->keep_bf16_qkv &&
+           dit->keep_bf16_attention_out == core->keep_bf16_attention_out &&
+           dit->use_int8_row_fc2 == core->use_int8_row_fc2 &&
+           dit->use_slower_grouped_quantizer ==
+               core->use_slower_grouped_quantizer &&
+           dit->bf16_final == core->bf16_final;
+}
+
+static void adopt_core(h3_dit *dit, h3_dit *core) {
+#define MOVE(field) do { dit->field = core->field; core->field = NULL; } while (0)
+    MOVE(video_patch_w); MOVE(video_patch_b);
+    MOVE(audio_patch_w); MOVE(audio_patch_b);
+    MOVE(final_norm); MOVE(final_video_w); MOVE(final_video_b);
+    MOVE(final_audio_w); MOVE(final_audio_b);
+#undef MOVE
+    memcpy(dit->blocks, core->blocks, sizeof(dit->blocks));
+    memset(core->blocks, 0, sizeof(core->blocks));
+    dit->core_adopted = 1;
+}
+
 static h3_dit *load_dit(const char *weight_directory,
                         const char *shader_source_path,
                         const h3_text_embedding *text,
@@ -1584,6 +1697,7 @@ static h3_dit *load_dit(const char *weight_directory,
                         h3_dit_progress progress, void *progress_opaque,
                         char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
+    h3_dit *core = NULL;
     if (!weight_directory || !shader_source_path || !layout || !sigmas ||
         (ssd_streaming != 0 && ssd_streaming != 1) ||
         !isfinite(spatial_rope_scale) || spatial_rope_scale <= 0.0f ||
@@ -1625,10 +1739,27 @@ static h3_dit *load_dit(const char *weight_directory,
         goto failed;
     }
     dit->sigmas = *sigmas;
-    dit->weights = h3_weight_store_open(weight_directory, error, error_size);
-    if (!dit->weights) goto failed;
-    dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
-    if (!dit->gpu) goto failed;
+    dit->weight_directory = strdup(weight_directory);
+    if (!dit->weight_directory) {
+        fail(error, error_size, "out of memory copying DiT weight path");
+        goto failed;
+    }
+    core = retained_core;
+    retained_core = NULL;
+    if (core && !ssd_streaming &&
+        !strcmp(core->weight_directory, weight_directory)) {
+        dit->weights = core->weights;
+        dit->gpu = core->gpu;
+        core->weights = NULL;
+        core->gpu = NULL;
+    } else {
+        h3_dit_free(core);
+        core = NULL;
+        dit->weights = h3_weight_store_open(weight_directory, error, error_size);
+        if (!dit->weights) goto failed;
+        dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
+        if (!dit->gpu) goto failed;
+    }
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
     dit->int8_mlp = !dit->ssd_streaming && dit->fused_mlp &&
                     !use_slower_bf16_mlp &&
@@ -1667,20 +1798,33 @@ static h3_dit *load_dit(const char *weight_directory,
     if (!refine_text(dit, text, error, error_size)) goto failed;
     report(progress, progress_opaque, "refine text", 1, 1);
     schedule_progress schedule_state = {progress, progress_opaque};
-    dit->schedule = h3_dit_schedule_precompute(
-        dit->weights, dit->gpu, sigmas, dit->video_condition_rows != 0,
-        dit->audio_condition_rows != 0, schedule_report, &schedule_state,
-        error, error_size);
+    if (core && schedule_matches(dit, core)) {
+        dit->schedule = core->schedule;
+        core->schedule = NULL;
+    } else {
+        dit->schedule = h3_dit_schedule_precompute(
+            dit->weights, dit->gpu, sigmas, dit->video_condition_rows != 0,
+            dit->audio_condition_rows != 0, schedule_report, &schedule_state,
+            error, error_size);
+    }
     if (dit->schedule) {
         configure_gate_ranked_blocks(dit);
         h3_dit_schedule_prune(dit->schedule, dit->block_active,
                               H3_DIT_BLOCKS);
     }
+    if (core && dit->schedule && core_matches(dit, core)) {
+        adopt_core(dit, core);
+        report(progress, progress_opaque, "load transformer core",
+               H3_DIT_BLOCKS, H3_DIT_BLOCKS);
+    }
+    h3_dit_free(core);  /* before load_core, so two cores never coexist */
+    core = NULL;
     if (!dit->schedule || !prepare_rope(dit, error, error_size) ||
         !prepare_maps(dit, text, error, error_size) ||
         !prepare_projection_maps(dit, error, error_size) ||
         !prepare_token_reduction_maps(dit, error, error_size) ||
-        !load_core(dit, progress, progress_opaque, error, error_size) ||
+        !(dit->core_adopted ||
+          load_core(dit, progress, progress_opaque, error, error_size)) ||
         !allocate_activations(dit, error, error_size)) goto failed;
     if ((wanted_video_condition && !h3_gpu_tensor_write_f32_range(
              dit->video_input, 0, condition_video_rows,
@@ -1694,6 +1838,7 @@ static h3_dit *load_dit(const char *weight_directory,
     h3_gpu_profile_mark(dit->gpu, "load");
     return dit;
 failed:
+    h3_dit_free(core);
     h3_dit_free(dit);
     return NULL;
 }
@@ -2994,19 +3139,7 @@ int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
 
 void h3_dit_free(h3_dit *dit) {
     if (!dit) return;
-    int steps = h3_dit_schedule_steps(dit->schedule);
-    if (dit->row_maps) for (int step = 0; step < steps; step++)
-        h3_gpu_tensor_free(dit->row_maps[step]);
-    if (dit->reduced_row_maps) for (int step = 0; step < steps; step++)
-        h3_gpu_tensor_free(dit->reduced_row_maps[step]);
-    if (dit->final_audio_maps) for (int step = 0; step < steps; step++)
-        h3_gpu_tensor_free(dit->final_audio_maps[step]);
-    if (dit->final_video_maps) for (int step = 0; step < steps; step++)
-        h3_gpu_tensor_free(dit->final_video_maps[step]);
-    free(dit->row_maps);
-    free(dit->reduced_row_maps);
-    free(dit->final_audio_maps);
-    free(dit->final_video_maps);
+    free_step_maps(dit);
     free_tensor(&dit->refined_text);
     free_tensor(&dit->rope_cos);
     free_tensor(&dit->rope_sin);
@@ -3058,6 +3191,7 @@ void h3_dit_free(h3_dit *dit) {
     h3_gpu_free(dit->gpu);
     h3_weight_store_free(dit->weights);
     h3_layout_free(&dit->layout);
+    free(dit->weight_directory);
     free(dit);
 }
 

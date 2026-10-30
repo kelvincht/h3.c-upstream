@@ -181,6 +181,9 @@ const h3_model_info *h3_model(const h3_ctx *ctx);
  * the original phase-by-phase memory lifetime. */
 void h3_cache_set_enabled(h3_ctx *ctx, int enabled);
 void h3_cache_clear(h3_ctx *ctx);
+/* Drop prompt conditioning and the prepared DiT, keeping resident weights and
+ * the video decoder for the next render with new inputs. */
+void h3_cache_clear_conditioning(h3_ctx *ctx);
 void h3_cache_get_info(const h3_ctx *ctx, h3_cache_info *info);
 
 /* Generate media, delivering decoded frames incrementally through on_frame. */

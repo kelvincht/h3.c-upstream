@@ -51,10 +51,20 @@ static void h3_conditioning_cache_clear(h3_ctx *ctx) {
     ctx->conditioning_present = 0;
 }
 
+void h3_cache_clear_conditioning(h3_ctx *ctx) {
+    if (!ctx) return;
+    h3_conditioning_cache_clear(ctx);
+    h3_dit_retain_core(ctx->dit);
+    ctx->dit = NULL;
+    free(ctx->dit_key);
+    ctx->dit_key = NULL;
+}
+
 void h3_cache_clear(h3_ctx *ctx) {
     if (!ctx) return;
     h3_conditioning_cache_clear(ctx);
     h3_dit_free(ctx->dit);
+    h3_dit_release_core();
     ctx->dit = NULL;
     free(ctx->dit_key);
     ctx->dit_key = NULL;
@@ -986,7 +996,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     if (ctx->cache_enabled && ctx->dit &&
         (!ctx->dit_key || strcmp(ctx->dit_key, prepared_key))) {
-        h3_dit_free(ctx->dit);
+        h3_dit_retain_core(ctx->dit);
         ctx->dit = NULL;
         free(ctx->dit_key);
         ctx->dit_key = NULL;

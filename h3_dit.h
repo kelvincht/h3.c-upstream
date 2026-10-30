@@ -76,6 +76,11 @@ h3_dit *h3_dit_load_conditioned(
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size);
 void h3_dit_free(h3_dit *dit);
+/* Free a prepared DiT but keep its resident core weights and AdaLN schedule
+ * for the next load of the same checkpoint (a later load adopts what still
+ * matches and frees the rest). Release drops them now. */
+void h3_dit_retain_core(h3_dit *dit);
+void h3_dit_release_core(void);
 
 /* Reset mutable sampler state and replace seed-dependent condition rows before
  * reusing an otherwise identical prepared transformer. */
