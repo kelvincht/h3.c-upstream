@@ -70,7 +70,8 @@ def f32_to_bf16_bytes(x):
 
 
 def clone(src, dst):
-    if subprocess.run(["cp", "-c", str(src), str(dst)],
+    # /bin/cp: a GNU cp earlier on PATH has no -c and would silently fall back to a full copy.
+    if subprocess.run(["/bin/cp", "-c", str(src), str(dst)],
                       capture_output=True).returncode != 0:
         shutil.copy2(src, dst)
 
