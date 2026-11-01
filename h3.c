@@ -12,6 +12,7 @@
 #include "h3_video_vae.h"
 #include "h3_vision_encoder.h"
 
+#include <CommonCrypto/CommonDigest.h>
 #include <errno.h>
 #include <pthread.h>
 #include <math.h>
@@ -135,16 +136,32 @@ static int h3_key_append(h3_key *key, const char *format, ...) {
     return 1;
 }
 
+/* Inputs are keyed by content, so the same image under a new path (a server
+ * writing each upload to a fresh file) still hits the cache, and a file
+ * rewritten in place misses it. */
 static int h3_key_file(h3_key *key, const char *role, const char *path) {
     if (!path) return h3_key_append(key, "|%s=none", role);
-    struct stat status;
-    if (stat(path, &status) != 0)
+    FILE *file = fopen(path, "rb");
+    if (!file)
         return h3_key_append(key, "|%s=%zu:%s:missing", role,
                              strlen(path), path);
-    return h3_key_append(key, "|%s=%zu:%s:%lld:%lld:%ld", role, strlen(path),
-                         path, (long long)status.st_size,
-                         (long long)status.st_mtimespec.tv_sec,
-                         status.st_mtimespec.tv_nsec);
+    CC_SHA256_CTX sha;
+    CC_SHA256_Init(&sha);
+    unsigned char buffer[1 << 16];
+    size_t got;
+    while ((got = fread(buffer, 1, sizeof(buffer), file)) > 0)
+        CC_SHA256_Update(&sha, buffer, (CC_LONG)got);
+    int failed = ferror(file);
+    fclose(file);
+    if (failed)
+        return h3_key_append(key, "|%s=%zu:%s:unreadable", role,
+                             strlen(path), path);
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256_Final(digest, &sha);
+    if (!h3_key_append(key, "|%s=sha256:", role)) return 0;
+    for (int at = 0; at < CC_SHA256_DIGEST_LENGTH; at++)
+        if (!h3_key_append(key, "%02x", digest[at])) return 0;
+    return 1;
 }
 
 static char *h3_conditioning_key(const char *prompt, const h3_params *params,
