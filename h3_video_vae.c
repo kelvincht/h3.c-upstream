@@ -30,7 +30,8 @@ enum {
     OUTPUT_PATCH = 3 * 4 * 16 * 16,
     SPATIAL_RATIO = 16,
     TILE_PIXELS = 256,
-    TILE_OVERLAP_MIN = 64
+    TILE_OVERLAP_MIN = 64,
+    SEAM_MARGIN = 16
 };
 
 /* H3_VAE_PRECISION selects the arithmetic of the four large block matmuls.
@@ -1121,69 +1122,91 @@ static float *extract_latent_tile(const float *latent, int full_t,
     return tile;
 }
 
+/* Weight of a tile's pixel `position` along one axis for the overlap it shares
+ * with a neighbour on the low side (`low`) and on the high side (`high`, 0 when
+ * there is none). The outermost SEAM_MARGIN pixels of an overlap get no weight
+ * because tile borders decode with less attention context; the rest fades with
+ * a raised cosine, so neighbouring weights sum to one. */
+static float tile_edge_weight(int position, int length, int low, int high) {
+    float weight = 1.0f;
+    int distance[2] = {position, length - 1 - position};
+    int overlap[2] = {low, high};
+    for (int side = 0; side < 2; side++) {
+        if (!overlap[side]) continue;
+        int margin = overlap[side] >= 4 * SEAM_MARGIN ? SEAM_MARGIN : 0;
+        float ramp = (float)(distance[side] - margin) + 0.5f;
+        float span = (float)(overlap[side] - 2 * margin);
+        if (ramp <= 0.0f) return 0.0f;
+        if (ramp < span)
+            weight *= 0.5f - 0.5f * cosf((float)M_PI * ramp / span);
+    }
+    return weight;
+}
+
+/* Every output pixel is the normalized weighted sum of the tiles covering it,
+ * with separable weights, so a pixel in the corner where four tiles overlap
+ * blends all four rather than blending two pairs in sequence. */
 static int stitch_tiles(float **tiles, const tile_axis *y_axis,
                         const tile_axis *x_axis, int frame_count,
                         h3_video_frames *output,
                         char *error, size_t error_size) {
     int full_h = y_axis->starts[y_axis->count - 1] + y_axis->length;
     int full_w = x_axis->starts[x_axis->count - 1] + x_axis->length;
-    size_t count = (size_t)frame_count * (size_t)full_h *
-                   (size_t)full_w * 3;
-    float *rgb = malloc(count * sizeof(*rgb));
-    if (!rgb) {
+    size_t pixels = (size_t)full_h * (size_t)full_w;
+    size_t count = (size_t)frame_count * pixels * 3;
+    float *rgb = calloc(count, sizeof(*rgb));
+    float *total = calloc(pixels, sizeof(*total));
+    float *weight_y = malloc((size_t)y_axis->length * sizeof(*weight_y));
+    float *weight_x = malloc((size_t)x_axis->length * sizeof(*weight_x));
+    if (!rgb || !total || !weight_y || !weight_x) {
+        free(rgb);
+        free(total);
+        free(weight_y);
+        free(weight_x);
         fail(error, error_size, "out of memory stitching video VAE tiles");
         return 0;
     }
-    for (int tile_y = 0; tile_y < y_axis->count; tile_y++)
+    for (int tile_y = 0; tile_y < y_axis->count; tile_y++) {
+        int low_y = tile_y ? y_axis->overlaps[tile_y - 1] : 0;
+        int high_y = tile_y + 1 < y_axis->count ? y_axis->overlaps[tile_y] : 0;
+        for (int y = 0; y < y_axis->length; y++)
+            weight_y[y] = tile_edge_weight(y, y_axis->length, low_y, high_y);
         for (int tile_x = 0; tile_x < x_axis->count; tile_x++) {
-            int index = tile_y * x_axis->count + tile_x;
-            const float *current = tiles[index];
-            const float *above = tile_y ? tiles[index - x_axis->count] : NULL;
-            const float *left = tile_x ? tiles[index - 1] : NULL;
-            int overlap_y = tile_y ? y_axis->overlaps[tile_y - 1] : 0;
-            int overlap_x = tile_x ? x_axis->overlaps[tile_x - 1] : 0;
-            int keep_h = y_axis->length -
-                (tile_y + 1 < y_axis->count ? y_axis->overlaps[tile_y] : 0);
-            int keep_w = x_axis->length -
-                (tile_x + 1 < x_axis->count ? x_axis->overlaps[tile_x] : 0);
-            for (int frame = 0; frame < frame_count; frame++)
-                for (int y = 0; y < keep_h; y++)
-                    for (int x = 0; x < keep_w; x++)
-                        for (int channel = 0; channel < 3; channel++) {
-                            size_t local = (((size_t)frame *
-                                (size_t)y_axis->length + (size_t)y) *
-                                (size_t)x_axis->length + (size_t)x) * 3 +
-                                (size_t)channel;
-                            float value = current[local];
-                            if (above && y < overlap_y) {
-                                size_t top = (((size_t)frame *
-                                    (size_t)y_axis->length +
-                                    (size_t)(y_axis->length - overlap_y + y)) *
-                                    (size_t)x_axis->length + (size_t)x) * 3 +
-                                    (size_t)channel;
-                                float alpha = (float)y / (float)overlap_y;
-                                value = above[top] * (1.0f - alpha) +
-                                        value * alpha;
-                            }
-                            if (left && x < overlap_x) {
-                                size_t prior = (((size_t)frame *
-                                    (size_t)y_axis->length + (size_t)y) *
-                                    (size_t)x_axis->length +
-                                    (size_t)(x_axis->length - overlap_x + x)) *
-                                    3 + (size_t)channel;
-                                float alpha = (float)x / (float)overlap_x;
-                                value = left[prior] * (1.0f - alpha) +
-                                        value * alpha;
-                            }
-                            size_t destination = (((size_t)frame *
-                                (size_t)full_h +
-                                (size_t)(y_axis->starts[tile_y] + y)) *
-                                (size_t)full_w +
-                                (size_t)(x_axis->starts[tile_x] + x)) * 3 +
-                                (size_t)channel;
-                            rgb[destination] = value;
-                        }
+            int low_x = tile_x ? x_axis->overlaps[tile_x - 1] : 0;
+            int high_x = tile_x + 1 < x_axis->count ?
+                x_axis->overlaps[tile_x] : 0;
+            for (int x = 0; x < x_axis->length; x++)
+                weight_x[x] = tile_edge_weight(x, x_axis->length, low_x,
+                                               high_x);
+            const float *current = tiles[tile_y * x_axis->count + tile_x];
+            for (int y = 0; y < y_axis->length; y++)
+                for (int x = 0; x < x_axis->length; x++) {
+                    float weight = weight_y[y] * weight_x[x];
+                    if (weight == 0.0f) continue;
+                    size_t pixel = (size_t)(y_axis->starts[tile_y] + y) *
+                        (size_t)full_w + (size_t)(x_axis->starts[tile_x] + x);
+                    total[pixel] += weight;
+                    for (int frame = 0; frame < frame_count; frame++) {
+                        const float *source = current + (((size_t)frame *
+                            (size_t)y_axis->length + (size_t)y) *
+                            (size_t)x_axis->length + (size_t)x) * 3;
+                        float *destination = rgb +
+                            ((size_t)frame * pixels + pixel) * 3;
+                        for (int channel = 0; channel < 3; channel++)
+                            destination[channel] += weight * source[channel];
+                    }
+                }
         }
+    }
+    for (size_t pixel = 0; pixel < pixels; pixel++) {
+        float scale = 1.0f / total[pixel];
+        for (int frame = 0; frame < frame_count; frame++)
+            for (int channel = 0; channel < 3; channel++)
+                rgb[((size_t)frame * pixels + pixel) * 3 + channel] *= scale;
+    }
+    free(total);
+    free(weight_y);
+    free(weight_x);
     output->frames = frame_count;
     output->height = full_h;
     output->width = full_w;
