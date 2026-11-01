@@ -1143,6 +1143,94 @@ static float tile_edge_weight(int position, int length, int low, int high) {
     return weight;
 }
 
+/* The decoder emits each latent token as its own 16x16 patch, which leaves a
+ * static step on every patch border, visible on smooth skin. At each border
+ * pixel the excess step (the step minus the mean of its neighbouring steps) is
+ * averaged over +-DEBLOCK_RADIUS frames, where moving content cancels and the
+ * static error stays, then removed with a cosine taper over DEBLOCK_TAPER
+ * pixels each side. Averages of DEBLOCK_LIMIT or more are real edges and are
+ * left alone. A per-frame estimate is too noisy to remove in full. */
+enum { DEBLOCK_RADIUS = 12, DEBLOCK_TAPER = 6 };
+#define DEBLOCK_LIMIT (10.0f / 255.0f)
+
+static int deblock_axis(float *rgb, int frames, int count, size_t along,
+                        int others, size_t other, size_t frame_stride) {
+    int borders = count / SPATIAL_RATIO - 1;
+    if (borders < 1) return 1;
+    size_t series = (size_t)borders * (size_t)others * 3;
+    float *excess = malloc((size_t)frames * series * sizeof(*excess));
+    float *window = malloc((size_t)frames * sizeof(*window));
+    if (!excess || !window) {
+        free(excess);
+        free(window);
+        return 0;
+    }
+    /* Left and right weights at the border sum to 1, removing the full step. */
+    float ramp[DEBLOCK_TAPER], taper = (float)DEBLOCK_TAPER;
+    for (int j = 0; j < DEBLOCK_TAPER; j++)
+        ramp[j] = 0.5f + 0.5f * cosf((float)M_PI * ((float)j + 0.5f) / taper);
+    float norm = 2.0f * ramp[0];
+    for (int j = 0; j < DEBLOCK_TAPER; j++) ramp[j] /= norm;
+    for (int t = 0; t < frames; t++)
+        for (int b = 0; b < borders; b++)
+            for (int o = 0; o < others; o++)
+                for (int c = 0; c < 3; c++) {
+                    const float *p = rgb + (size_t)t * frame_stride +
+                        (size_t)o * other + c;
+                    size_t x = (size_t)(b + 1) * SPATIAL_RATIO;
+                    float before = p[(x - 1) * along] - p[(x - 2) * along];
+                    float step = p[x * along] - p[(x - 1) * along];
+                    float after = p[(x + 1) * along] - p[x * along];
+                    excess[(size_t)t * series +
+                           ((size_t)b * (size_t)others + (size_t)o) * 3 + c] =
+                        step - 0.5f * (before + after);
+                }
+    for (size_t s = 0; s < series; s++) {
+        for (int t = 0; t < frames; t++) {
+            float sum = 0.0f;
+            for (int k = t - DEBLOCK_RADIUS; k <= t + DEBLOCK_RADIUS; k++) {
+                int clamped = k < 0 ? 0 : k >= frames ? frames - 1 : k;
+                sum += excess[(size_t)clamped * series + s];
+            }
+            window[t] = sum / (2 * DEBLOCK_RADIUS + 1);
+        }
+        for (int t = 0; t < frames; t++)
+            excess[(size_t)t * series + s] =
+                fabsf(window[t]) < DEBLOCK_LIMIT ? window[t] : 0.0f;
+    }
+    for (int t = 0; t < frames; t++)
+        for (int b = 0; b < borders; b++)
+            for (int o = 0; o < others; o++)
+                for (int c = 0; c < 3; c++) {
+                    float e = excess[(size_t)t * series +
+                        ((size_t)b * (size_t)others + (size_t)o) * 3 + c];
+                    if (e == 0.0f) continue;
+                    float *p = rgb + (size_t)t * frame_stride +
+                        (size_t)o * other + c;
+                    size_t x = (size_t)(b + 1) * SPATIAL_RATIO;
+                    for (int j = 0; j < DEBLOCK_TAPER; j++) {
+                        p[(x - 1 - (size_t)j) * along] += e * ramp[j];
+                        p[(x + (size_t)j) * along] -= e * ramp[j];
+                    }
+                }
+    free(excess);
+    free(window);
+    return 1;
+}
+
+static int deblock_patch_borders(float *rgb, int frames, int height, int width,
+                                 char *error, size_t error_size) {
+    const char *value = getenv("H3_VAE_DEBLOCK");
+    if (value && !strcmp(value, "0")) return 1;
+    size_t row = (size_t)width * 3, frame = (size_t)height * row;
+    if (!deblock_axis(rgb, frames, width, 3, height, row, frame) ||
+        !deblock_axis(rgb, frames, height, row, width, 3, frame)) {
+        fail(error, error_size, "out of memory deblocking video VAE output");
+        return 0;
+    }
+    return 1;
+}
+
 /* Every output pixel is the normalized weighted sum of the tiles covering it,
  * with separable weights, so a pixel in the corner where four tiles overlap
  * blends all four rather than blending two pairs in sequence. */
@@ -1412,6 +1500,10 @@ int h3_video_vae_decoder_decode(h3_video_vae_decoder *decoder,
     if (ok) {
         memcpy(final_rgb + (size_t)chunks * 17 * frame_elements,
                temporal_overlap, 5 * frame_elements * sizeof(*final_rgb));
+        ok = deblock_patch_borders(final_rgb, output_frames, pixel_h, pixel_w,
+                                   error, error_size);
+    }
+    if (ok) {
         output->frames = output_frames;
         output->height = pixel_h;
         output->width = pixel_w;
@@ -1553,6 +1645,10 @@ static int decode_chunked(const char *weight_directory,
     if (ok) {
         memcpy(final_rgb + (size_t)chunks * 17 * frame_elements,
                temporal_overlap, 5 * frame_elements * sizeof(*final_rgb));
+        ok = deblock_patch_borders(final_rgb, output_frames, pixel_h, pixel_w,
+                                   error, error_size);
+    }
+    if (ok) {
         output->frames = output_frames;
         output->height = pixel_h;
         output->width = pixel_w;
