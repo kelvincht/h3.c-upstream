@@ -3051,6 +3051,7 @@ int h3_dit_denoise_euler_span(
                          float *audio_latent, int reuse_interval,
                          int first_step, int stop_step,
                          float *snapshot_video, float *snapshot_audio,
+                         uint32_t renoise_seed,
                          h3_dit_progress progress, void *progress_opaque,
                          h3_dit_preview preview, void *preview_opaque,
                          char *error, size_t error_size) {
@@ -3127,7 +3128,6 @@ int h3_dit_denoise_euler_span(
     int last_evaluated = -1;
     int previous_evaluated = -1;
     h3_rng renoise_rng;
-    uint32_t renoise_seed;
     /* Re-noising overwrites the latent with fresh noise each step, so the clean estimate for a stopped
      * (preview) run is the last x0 taken before the re-noise, not an Euler step from the re-noised state. */
     float *estimate_video = NULL, *estimate_audio = NULL;
@@ -3142,8 +3142,14 @@ int h3_dit_denoise_euler_span(
             return 0;
         }
     }
-    memcpy(&renoise_seed, video_latent, sizeof(renoise_seed));
     h3_rng_seed(&renoise_rng, 0x9e3779b97f4a7c15ULL ^ renoise_seed);
+    /* A resumed span draws the same noise as an unbroken run: skip the draws of the earlier steps. */
+    if (h3_renoise_enabled())
+        for (int step = 0; step < first_step; step++) {
+            size_t draws = (dit->sigmas.video[step + 1] > 0.0f ? video_count : 0) +
+                           (dit->sigmas.audio[step + 1] > 0.0f ? audio_count : 0);
+            for (size_t i = 0; i < draws; i++) (void)h3_rng_normal(&renoise_rng);
+        }
     for (int step = first_step; step < stop_step && ok; step++) {
         report(progress, progress_opaque, "denoise", step, dit->sigmas.steps);
         int evaluate = selected[step];
@@ -3247,9 +3253,12 @@ int h3_dit_denoise_euler_preview(
                          h3_dit_progress progress, void *progress_opaque,
                          h3_dit_preview preview, void *preview_opaque,
                          char *error, size_t error_size) {
+    uint32_t renoise_seed = 0;
+    if (video_latent) memcpy(&renoise_seed, video_latent, sizeof(renoise_seed));
     return h3_dit_denoise_euler_span(
         dit, video_latent, audio_latent, reuse_interval, 0,
-        dit ? dit->sigmas.steps : 0, NULL, NULL, progress, progress_opaque,
+        dit ? dit->sigmas.steps : 0, NULL, NULL, renoise_seed,
+        progress, progress_opaque,
         preview, preview_opaque, error, error_size);
 }
 

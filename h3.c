@@ -1747,9 +1747,15 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         prefetching = !pthread_create(&prefetch_thread, NULL,
                                       h3_vae_prefetch_run, &prefetch);
     }
+    /* The re-noise stream is keyed by the initial noise, which a resumed run no longer holds. */
+    h3_rng initial_rng;
+    h3_rng_seed(&initial_rng, params->seed);
+    float initial_first = h3_rng_normal(&initial_rng);
+    uint32_t renoise_seed;
+    memcpy(&renoise_seed, &initial_first, sizeof(renoise_seed));
     int denoise_ok = h3_dit_denoise_euler_span(
             dit, video, audio, params->denoise_reuse, first_step, stop_step,
-            snapshot_video, snapshot_audio,
+            snapshot_video, snapshot_audio, renoise_seed,
             h3_dit_progress_bridge, &progress,
             preview_decoder ? h3_deliver_denoise_preview : NULL,
             preview_decoder ? &live_preview : NULL,
