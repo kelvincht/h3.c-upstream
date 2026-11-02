@@ -532,8 +532,9 @@ int h3_ffmpeg_write_rgb24(const char *path, const uint8_t *frames,
         "ffmpeg", "-y", "-loglevel", "error",
         "-f", "rawvideo", "-pixel_format", "rgb24",
         "-video_size", size, "-framerate", rate,
-        "-i", "pipe:0", "-an", "-c:v", "libx264",
-        "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
+        "-i", "pipe:0", "-an", "-c:v", "libx265",
+        "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p10le",
+        "-x265-params", "log-level=error", "-tag:v", "hvc1",
         "-movflags", "+faststart", (char *)path, NULL
     };
     posix_spawn_file_actions_t actions;
@@ -672,8 +673,11 @@ int h3_ffmpeg_write_av_rgb24_f32(const char *path, const uint8_t *frames,
         "-f", "f32le", "-ar", audio_rate, "-ac", audio_channels,
         "-i", audio_input,
         "-map", "0:v:0", "-map", "1:a:0",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+        /* x264's 16x16 macroblocks land on the decoder's 16-px patch grid
+         * and bring the removed border steps back; x265 10-bit does not. */
+        "-c:v", "libx265", "-preset", "fast", "-crf", "20",
+        "-pix_fmt", "yuv420p10le", "-x265-params", "log-level=error",
+        "-tag:v", "hvc1", "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart", (char *)path, NULL
     };
     posix_spawn_file_actions_t actions;
