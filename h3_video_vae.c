@@ -1148,10 +1148,12 @@ static float tile_edge_weight(int position, int length, int low, int high) {
  * pixel the excess step (the step minus the mean of its neighbouring steps) is
  * averaged over +-DEBLOCK_RADIUS frames, where moving content cancels and the
  * static error stays, then removed with a cosine taper over DEBLOCK_TAPER
- * pixels each side. Averages of DEBLOCK_LIMIT or more are real edges and are
- * left alone. A per-frame estimate is too noisy to remove in full. */
+ * pixels each side. The correction is clamped to DEBLOCK_LIMIT, so a real edge
+ * on a border changes by at most that; it is clamped, not skipped, because
+ * patch steps on skin reach ~10/255. A per-frame estimate is too noisy to
+ * remove in full. */
 enum { DEBLOCK_RADIUS = 12, DEBLOCK_TAPER = 6 };
-#define DEBLOCK_LIMIT (10.0f / 255.0f)
+#define DEBLOCK_LIMIT (16.0f / 255.0f)
 
 static int deblock_axis(float *rgb, int frames, int count, size_t along,
                         int others, size_t other, size_t frame_stride) {
@@ -1196,7 +1198,7 @@ static int deblock_axis(float *rgb, int frames, int count, size_t along,
         }
         for (int t = 0; t < frames; t++)
             excess[(size_t)t * series + s] =
-                fabsf(window[t]) < DEBLOCK_LIMIT ? window[t] : 0.0f;
+                fminf(fmaxf(window[t], -DEBLOCK_LIMIT), DEBLOCK_LIMIT);
     }
     for (int t = 0; t < frames; t++)
         for (int b = 0; b < borders; b++)
