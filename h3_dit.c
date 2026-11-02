@@ -2724,6 +2724,7 @@ static int parse_reuse_steps(int steps, uint8_t *selected) {
 static int gpu_sampler_requested(const h3_dit *dit) {
     const char *cpu = getenv("H3_CPU_SAMPLER");
     if (cpu && *cpu && strcmp(cpu, "0")) return 0;
+    if (h3_renoise_enabled()) return 0;
     const char *value = getenv("H3_GPU_SAMPLER");
     if (value) return *value && strcmp(value, "0");
     return h3_gpu_is_m5(dit->gpu);
@@ -3033,6 +3034,18 @@ int h3_dit_denoise(h3_dit *dit, float *video_latent, float *audio_latent,
     return ok;
 }
 
+/* Flex: jump to the clean estimate (velocity = x0 - noise), then re-noise to
+ * sigma_next with fresh noise. */
+static void renoise_step(float *sample, const float *velocity, size_t count,
+                         float sigma, float sigma_next, h3_rng *rng) {
+    for (size_t i = 0; i < count; i++) {
+        float x0 = sample[i] + sigma * velocity[i];
+        sample[i] = sigma_next > 0.0f
+            ? (1.0f - sigma_next) * x0 + sigma_next * h3_rng_normal(rng)
+            : x0;
+    }
+}
+
 int h3_dit_denoise_euler_span(
                          h3_dit *dit, float *video_latent,
                          float *audio_latent, int reuse_interval,
@@ -3113,6 +3126,10 @@ int h3_dit_denoise_euler_span(
     int ok = 1;
     int last_evaluated = -1;
     int previous_evaluated = -1;
+    h3_rng renoise_rng;
+    uint32_t renoise_seed;
+    memcpy(&renoise_seed, video_latent, sizeof(renoise_seed));
+    h3_rng_seed(&renoise_rng, 0x9e3779b97f4a7c15ULL ^ renoise_seed);
     for (int step = first_step; step < stop_step && ok; step++) {
         report(progress, progress_opaque, "denoise", step, dit->sigmas.steps);
         int evaluate = selected[step];
@@ -3148,7 +3165,14 @@ int h3_dit_denoise_euler_span(
                     ? dit->sigmas.audio[previous_evaluated] : 0.0f,
                 previous_evaluated >= 0);
         }
-        if (ok) {
+        if (ok && h3_renoise_enabled()) {
+            renoise_step(video_latent, video_velocity, video_count,
+                         dit->sigmas.video[step], dit->sigmas.video[step + 1],
+                         &renoise_rng);
+            renoise_step(audio_latent, audio_velocity, audio_count,
+                         dit->sigmas.audio[step], dit->sigmas.audio[step + 1],
+                         &renoise_rng);
+        } else if (ok) {
             ok = h3_euler_velocity_step(
                      video_latent, video_velocity, video_count,
                      dit->sigmas.video[step], dit->sigmas.video[step + 1]) &&
