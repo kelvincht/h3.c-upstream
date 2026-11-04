@@ -1794,6 +1794,22 @@ static void adopt_core(h3_dit *dit, h3_dit *core) {
     dit->core_adopted = 1;
 }
 
+#define ADALN_KEY_BYTES (1024 + 3 * sizeof(int32_t) + 2 * (H3_MAX_STEPS + 1) * sizeof(float))
+
+/* Cache key for the AdaLN schedule: the checkpoint directory plus everything the schedule reads. */
+static size_t adaln_key_build(const h3_dit *dit, const h3_sigma_schedule *sigmas,
+                              int visual, int audio, unsigned char *key) {
+    memset(key, 0, ADALN_KEY_BYTES);
+    snprintf((char *)key, 1024, "%s", dit->weight_directory ? dit->weight_directory : "");
+    int32_t header[3] = {sigmas->steps, visual, audio};
+    size_t points = (size_t)sigmas->steps + 1;
+    memcpy(key + 1024, header, sizeof(header));
+    memcpy(key + 1024 + sizeof(header), sigmas->video, points * sizeof(float));
+    memcpy(key + 1024 + sizeof(header) + points * sizeof(float), sigmas->audio,
+           points * sizeof(float));
+    return 1024 + sizeof(header) + 2 * points * sizeof(float);
+}
+
 static h3_dit *load_dit(const char *weight_directory,
                         const char *shader_source_path,
                         const h3_text_embedding *text,
@@ -1927,7 +1943,14 @@ static h3_dit *load_dit(const char *weight_directory,
         dit->schedule = core->schedule;
         core->schedule = NULL;
     } else {
-        dit->schedule = h3_dit_schedule_precompute(
+        /* H3_ADALN_CACHE_DIR: the AdaLN schedule is keyed by checkpoint directory, steps,
+         * sigmas and condition rows (not seed or prompt), so a repeat of any of those is a hit. */
+        unsigned char adaln_key[ADALN_KEY_BYTES];
+        size_t adaln_key_bytes = adaln_key_build(
+            dit, sigmas, dit->video_condition_rows != 0,
+            dit->audio_condition_rows != 0, adaln_key);
+        dit->schedule = h3_dit_schedule_cached(
+            getenv("H3_ADALN_CACHE_DIR"), (const char *)adaln_key, adaln_key_bytes,
             dit->weights, dit->gpu, sigmas, dit->video_condition_rows != 0,
             dit->audio_condition_rows != 0, schedule_report, &schedule_state,
             error, error_size);
