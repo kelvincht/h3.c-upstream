@@ -14,6 +14,10 @@
 
 extern char **environ;
 
+/* swscale converts RGB with BT.601 unless told otherwise; convert and tag BT.709 limited range. */
+#define H3_BT709_ARGS "-vf", "scale=out_color_matrix=bt709:out_range=tv"
+#define H3_X265_PARAMS "log-level=error:colorprim=bt709:transfer=bt709:colormatrix=bt709:range=limited"
+
 static const char *ffmpeg_program(void) {
     const char *override = getenv("H3_FFMPEG");
     return override && *override ? override : "ffmpeg";
@@ -532,9 +536,9 @@ int h3_ffmpeg_write_rgb24(const char *path, const uint8_t *frames,
         "ffmpeg", "-y", "-loglevel", "error",
         "-f", "rawvideo", "-pixel_format", "rgb24",
         "-video_size", size, "-framerate", rate,
-        "-i", "pipe:0", "-an", "-c:v", "libx265",
+        "-i", "pipe:0", "-an", H3_BT709_ARGS, "-c:v", "libx265",
         "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p10le",
-        "-x265-params", "log-level=error", "-tag:v", "hvc1",
+        "-x265-params", H3_X265_PARAMS, "-tag:v", "hvc1",
         "-movflags", "+faststart", (char *)path, NULL
     };
     posix_spawn_file_actions_t actions;
@@ -672,11 +676,11 @@ int h3_ffmpeg_write_av_rgb24_f32(const char *path, const uint8_t *frames,
         "-i", "pipe:0",
         "-f", "f32le", "-ar", audio_rate, "-ac", audio_channels,
         "-i", audio_input,
-        "-map", "0:v:0", "-map", "1:a:0",
+        "-map", "0:v:0", "-map", "1:a:0", H3_BT709_ARGS,
         /* x264's 16x16 macroblocks land on the decoder's 16-px patch grid
          * and bring the removed border steps back; x265 10-bit does not. */
         "-c:v", "libx265", "-preset", "fast", "-crf", "20",
-        "-pix_fmt", "yuv420p10le", "-x265-params", "log-level=error",
+        "-pix_fmt", "yuv420p10le", "-x265-params", H3_X265_PARAMS,
         "-tag:v", "hvc1", "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart", (char *)path, NULL
     };
