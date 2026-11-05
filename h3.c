@@ -639,8 +639,8 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "stop step must be 0 (run all) or below the step count");
         return 0;
     }
-    if (params->denoise_reuse < 1 || params->denoise_reuse > 3) {
-        h3_set_error(ctx, "denoise reuse must be in [1, 3]");
+    if (params->denoise_reuse < 1 || params->denoise_reuse > 4) {
+        h3_set_error(ctx, "denoise reuse must be in [1, 4]");
         return 0;
     }
     if (params->dit_layers < H3_MIN_DIT_LAYERS ||
