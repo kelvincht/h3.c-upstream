@@ -687,8 +687,11 @@ h3_dit_schedule *h3_dit_schedule_cached(const char *cache_directory,
     h3_dit_schedule *hit = adaln_load(gpu, path, key, key_bytes);
     if (hit) {
         utimes(path, NULL);  /* most recently used */
+        fprintf(stderr, "h3: AdaLN schedule read from disk cache (%s)\n", path);
         return hit;
     }
+    fprintf(stderr, "h3: AdaLN schedule disk cache miss; computing (%d steps)\n",
+            sigmas->steps);
     h3_dit_schedule *built = h3_dit_schedule_precompute(
         weights, gpu, sigmas, visual_condition, audio_condition,
         progress, progress_opaque, error, error_size);

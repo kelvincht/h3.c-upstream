@@ -18,6 +18,7 @@
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -760,11 +761,39 @@ typedef struct {
     h3_ctx *ctx;
     const h3_params *params;
     int cancelled;
+    const char *phase;
+    double phase_start;
 } h3_generation_progress;
 
+/* Short SHA-256 of a cache key, so runs can be compared in logs without
+ * printing the whole key. Equal hashes mean equal keys. */
+static void h3_log_key(const char *label, const char *key) {
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(key, (CC_LONG)strlen(key), digest);
+    fprintf(stderr, "h3: %s key %02x%02x%02x%02x%02x%02x%02x%02x\n", label,
+            digest[0], digest[1], digest[2], digest[3],
+            digest[4], digest[5], digest[6], digest[7]);
+}
+
+static double h3_now_seconds(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (double)now.tv_sec + (double)now.tv_nsec * 1e-9;
+}
+
+/* Logs how long each phase took, one line when the next phase starts. Lets a
+ * run show where its time went without an external profiler. */
 static void h3_progress_emit(h3_generation_progress *state, const char *phase,
                              int completed, int total) {
     if (!state || state->cancelled || !state->params->on_progress) return;
+    if (!state->phase || strcmp(state->phase, phase)) {
+        double now = h3_now_seconds();
+        if (state->phase)
+            fprintf(stderr, "h3: phase %s %.2fs\n", state->phase,
+                    now - state->phase_start);
+        state->phase = phase;
+        state->phase_start = now;
+    }
     if (state->params->on_progress(phase, completed, total,
                                    state->params->callback_opaque)) {
         state->cancelled = 1;
@@ -813,7 +842,7 @@ static h3_video_vae_decoder *h3_acquire_video_decoder(
     if (ctx->cache_enabled && ctx->video_decoder &&
         ctx->video_decoder_key && !strcmp(ctx->video_decoder_key, key)) {
         *cached = 1;
-        fprintf(stderr, "h3: video VAE cache hit\n");
+        fprintf(stderr, "h3: video VAE decoder resident (reused, not loaded)\n");
         return ctx->video_decoder;
     }
     if (ctx->cache_enabled) {
@@ -822,9 +851,13 @@ static h3_video_vae_decoder *h3_acquire_video_decoder(
         free(ctx->video_decoder_key);
         ctx->video_decoder_key = NULL;
     }
+    double load_start = h3_now_seconds();
     h3_video_vae_decoder *decoder = h3_video_vae_decoder_load(
         weight_directory, "h3_shaders.metal", latent_height, latent_width,
         progress, progress_opaque, error, error_size);
+    if (decoder)
+        fprintf(stderr, "h3: video VAE decoder loaded in %.2fs (not resident)\n",
+                h3_now_seconds() - load_start);
     if (!decoder || !ctx->cache_enabled) return decoder;
     char *key_copy = strdup(key);
     if (!key_copy) {
@@ -834,7 +867,7 @@ static h3_video_vae_decoder *h3_acquire_video_decoder(
     ctx->video_decoder = decoder;
     ctx->video_decoder_key = key_copy;
     *cached = 1;
-    fprintf(stderr, "h3: video VAE cache miss; decoder retained\n");
+    fprintf(stderr, "h3: video VAE decoder retained for reuse\n");
     return decoder;
 }
 
@@ -848,13 +881,16 @@ typedef struct {
     int latent_w;
     h3_video_vae_decoder *decoder;
     char error[512];
+    double seconds;
 } h3_vae_prefetch;
 
 static void *h3_vae_prefetch_run(void *opaque) {
     h3_vae_prefetch *job = opaque;
+    double start = h3_now_seconds();
     job->decoder = h3_video_vae_decoder_load(
         job->weight_directory, "h3_shaders.metal", job->latent_h,
         job->latent_w, NULL, NULL, job->error, sizeof(job->error));
+    job->seconds = h3_now_seconds() - start;
     return NULL;
 }
 
@@ -994,6 +1030,12 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         return NULL;
     }
     if (!h3_valid_params(ctx, params)) return NULL;
+    double run_start = h3_now_seconds();
+    double load_avg_start = 0.0, load_avg_end = 0.0;
+    getloadavg(&load_avg_start, 1);
+    const char *dit_tier = "none";
+    const char *decoder_source = "none";
+    int text_encoded = 0;
     int render_width = params->render_width ? params->render_width :
                                                params->width;
     int render_height = params->render_height ? params->render_height :
@@ -1008,7 +1050,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "ordered references require the Ref2VA checkpoint");
         return NULL;
     }
-    h3_generation_progress progress = {ctx, params, 0};
+    h3_generation_progress progress = {ctx, params, 0, NULL, 0.0};
     h3_temporal_shape temporal = h3_temporal(params->frames);
     int latent_w, latent_h;
     h3_latent_canvas(render_width, render_height, &latent_w, &latent_h);
@@ -1091,6 +1133,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "out of memory constructing prepared-model cache key");
         goto cleanup;
     }
+    h3_log_key("conditioning", conditioning_key);
+    h3_log_key("prepared", prepared_key);
     h3_key decoder_cache_key = {0};
     if (!h3_key_append(&decoder_cache_key, "%s|%dx%d", vae_path,
                        latent_h, latent_w)) {
@@ -1538,6 +1582,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             h3_set_error(ctx, "Qwen reference vision count mismatch");
             goto cleanup;
         }
+        text_encoded = 1;
         h3_progress_emit(&progress, "text encoder", 0, 50);
         int text_ok = ref2va ? h3_multimodal_encode_ref2va_bf16(
                 tokenizer, text_path, "h3_shaders.metal", prompt,
@@ -1561,6 +1606,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             h3_set_error(ctx, "%s", detail);
             goto cleanup;
         }
+        text_encoded = 1;
         h3_progress_emit(&progress, "text encoder", 0, 50);
         if (!h3_text_encode_bf16(
                 text_path, "h3_shaders.metal", ids, token_count,
@@ -1619,7 +1665,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             h3_set_error(ctx, "%s", detail);
             goto cleanup;
         }
-        fprintf(stderr, "h3: prepared DiT cache hit\n");
+        dit_tier = "rebound";
+        fprintf(stderr, "h3: DiT rebound (same prompt, inputs, shape, steps)\n");
     } else if (conditioned) {
         dit = h3_dit_load_conditioned(
             dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
@@ -1665,6 +1712,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "%s", detail);
         goto cleanup;
     }
+    if (!dit_is_cached)
+        dit_tier = h3_dit_core_adopted(dit) ? "reactivated" : "reloaded";
     if (ctx->cache_enabled && !dit_is_cached) {
         char *key_copy = strdup(prepared_key);
         if (!key_copy) {
@@ -1673,7 +1722,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             ctx->dit = dit;
             ctx->dit_key = key_copy;
             dit_is_cached = 1;
-            fprintf(stderr, "h3: prepared DiT cache miss; model retained\n");
+            fprintf(stderr, h3_dit_core_adopted(dit)
+                    ? "h3: DiT reactivated (resident core adopted; prompt, inputs, shape or steps changed)\n"
+                    : "h3: DiT reloaded (core read from disk)\n");
         }
     }
     h3_text_embedding_free(&text);
@@ -1831,7 +1882,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         preview_decoder = prefetch.decoder;
         decoder_is_cached = 0;
         prefetch.decoder = NULL;
-        fprintf(stderr, "h3: video VAE prefetched during denoise\n");
+        decoder_source = "prefetched";
+        fprintf(stderr, "h3: video VAE decoder prefetched in %.2fs during denoise\n",
+                prefetch.seconds);
     }
     if (!preview_decoder && ctx->cache_enabled && prefetch.decoder) {
         char *key_copy = strdup(decoder_key);
@@ -1843,15 +1896,20 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             preview_decoder = prefetch.decoder;
             decoder_is_cached = 1;
             prefetch.decoder = NULL;
-            fprintf(stderr, "h3: video VAE prefetched during denoise\n");
+            decoder_source = "prefetched";
+            fprintf(stderr, "h3: video VAE decoder prefetched in %.2fs during denoise\n",
+                    prefetch.seconds);
         }
     }
     if (!preview_decoder && ctx->cache_enabled) {
+        int resident_before = ctx->video_decoder && ctx->video_decoder_key &&
+            !strcmp(ctx->video_decoder_key, decoder_key);
         h3_progress_emit(&progress, "video VAE load", 0, 36);
         preview_decoder = h3_acquire_video_decoder(
             ctx, decoder_key, vae_path, latent_h, latent_w,
             h3_vae_progress_bridge, &progress,
             &decoder_is_cached, detail, sizeof(detail));
+        decoder_source = resident_before ? "resident" : "loaded";
         if (preview_decoder && ctx->video_decoder == preview_decoder)
             h3_progress_emit(&progress, "video VAE load", 36, 36);
         if (!preview_decoder) {
@@ -1859,6 +1917,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
     }
+    h3_progress_emit(&progress, "video VAE decode", 0, 1);
     int video_ok = preview_decoder ?
         h3_video_vae_decoder_decode(
             preview_decoder, video, temporal.video_t, &frames,
@@ -1973,6 +2032,15 @@ cleanup:
     free(video); free(audio); free(rgb8);
     h3_video_frames_free(&frames);
     h3_audio_waveform_free(&waveform);
+    if (result) {
+        getloadavg(&load_avg_end, 1);
+        fprintf(stderr,
+                "h3: render summary: dit=%s conditioning=%s text_encoded=%d "
+                "image_encoded=%d decoder=%s seconds=%.2f load_avg=%.2f->%.2f\n",
+                dit_tier, conditioning_hit ? "hit" : "miss", text_encoded,
+                conditioning_hit ? 0 : (int)visual_count, decoder_source,
+                h3_now_seconds() - run_start, load_avg_start, load_avg_end);
+    }
     return result;
 }
 

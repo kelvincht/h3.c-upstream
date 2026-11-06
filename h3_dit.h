@@ -76,6 +76,9 @@ h3_dit *h3_dit_load_conditioned(
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size);
 void h3_dit_free(h3_dit *dit);
+/* 1 when this load took its resident core weights from a retained core (no
+ * int8 read or quantization), 0 when it read the core from disk. */
+int h3_dit_core_adopted(const h3_dit *dit);
 /* Free a prepared DiT but keep its resident core weights and AdaLN schedule
  * for the next load of the same checkpoint (a later load adopts what still
  * matches and frees the rest). Release drops them now. */

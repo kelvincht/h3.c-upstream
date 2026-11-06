@@ -1942,6 +1942,7 @@ static h3_dit *load_dit(const char *weight_directory,
     if (core && schedule_matches(dit, core)) {
         dit->schedule = core->schedule;
         core->schedule = NULL;
+        fprintf(stderr, "h3: AdaLN schedule retained with the core\n");
     } else {
         /* H3_ADALN_CACHE_DIR: the AdaLN schedule is keyed by checkpoint directory, steps,
          * sigmas and condition rows (not seed or prompt), so a repeat of any of those is a hit. */
@@ -3417,6 +3418,10 @@ int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
     return h3_dit_denoise_euler_preview(
         dit, video_latent, audio_latent, reuse_interval,
         progress, progress_opaque, NULL, NULL, error, error_size);
+}
+
+int h3_dit_core_adopted(const h3_dit *dit) {
+    return dit && dit->core_adopted;
 }
 
 void h3_dit_free(h3_dit *dit) {
