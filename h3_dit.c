@@ -1287,6 +1287,12 @@ static int int8_cache_open(h3_dit *dit, const char *path,
         return 1;
     }
     if (file) fclose(file);
+    if (!h3_weight_find(dit->weights, "blocks.0.mlp.fc1.weight", NULL)) {
+        fail(error, error_size,
+             "int8 cache %s invalid/missing and store %s has no BF16 block matrices (slim store); refusing to rebuild",
+             path, dit->weight_directory);
+        return 0;
+    }
     file = fopen(path, "wb");
     if (!file || fwrite(&want, sizeof(want), 1, file) != 1) {
         if (file) fclose(file);
@@ -1349,12 +1355,47 @@ static int int8_cache_block(h3_dit *dit, h3_dit_block *block, int loading,
     return ok;
 }
 
+static int path_ends_with(const char *path, const char *suffix) {
+    size_t path_length = strlen(path);
+    size_t suffix_length = strlen(suffix);
+    return path_length >= suffix_length &&
+           !strcmp(path + path_length - suffix_length, suffix);
+}
+
+/* Ref2VA and FL2VA transformers get separate cache files, so alternating pipelines in one
+ * process do not overwrite each other. Returns a malloc'd path. */
+static char *int8_cache_pipeline_path(const char *base, const char *weight_directory,
+                                      char *error, size_t error_size) {
+    const char *tag = NULL;
+    if (path_ends_with(weight_directory, "Ref2VA/transformer")) tag = ".ref2va";
+    else if (path_ends_with(weight_directory, "FL2VA/transformer")) tag = ".fl2va";
+    if (!tag) {
+        fail(error, error_size, "DiT int8 cache: transformer directory %s is neither Ref2VA nor FL2VA",
+             weight_directory);
+        return NULL;
+    }
+    char *path = malloc(strlen(base) + strlen(tag) + 1);
+    if (!path) {
+        fail(error, error_size, "out of memory creating DiT int8 cache path");
+        return NULL;
+    }
+    strcpy(path, base);
+    strcat(path, tag);
+    return path;
+}
+
 static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                      char *error, size_t error_size) {
-    if (getenv("H3_DIT_INT8_CACHE") && *getenv("H3_DIT_INT8_CACHE") && !dit->ssd_streaming &&
+    const char *cache_base = getenv("H3_DIT_INT8_CACHE");
+    if (cache_base && *cache_base && !dit->ssd_streaming &&
         dit->int8_mlp && dit->int8_qkv && dit->int8_attention_out &&
-        !dit->keep_bf16_mlp && !dit->keep_bf16_qkv && !dit->keep_bf16_attention_out &&
-        !int8_cache_open(dit, getenv("H3_DIT_INT8_CACHE"), error, error_size)) return 0;
+        !dit->keep_bf16_mlp && !dit->keep_bf16_qkv && !dit->keep_bf16_attention_out) {
+        char *cache_path = int8_cache_pipeline_path(
+            cache_base, dit->weight_directory, error, error_size);
+        int ok = cache_path && int8_cache_open(dit, cache_path, error, error_size);
+        free(cache_path);
+        if (!ok) return 0;
+    }
     for (unsigned index = 0; index < H3_DIT_BLOCKS; index++) {
         if (!dit->block_active[index]) {
             report(progress, opaque, "load transformer core", (int)index + 1,
