@@ -43,6 +43,12 @@ Two on-disk caches are opt-in environment variables: `H3_DIT_INT8_CACHE=<file>` 
 later loads (delete it after the checkpoint changes), and `H3_ADALN_CACHE_DIR=<dir>` stores the AdaLN schedule per checkpoint,
 steps, sigmas and condition rows, capped at 10 GiB with least-recently-used eviction.
 
+The int8 cache is per pipeline: the file used is the given path plus `.ref2va` or `.fl2va`, chosen by the transformer
+directory. `H3_SCHEDULER=beta57` selects the ComfyUI beta(0.5, 0.7) sigma grid instead of the released linear grid (the
+shift map and renoise are unchanged). A low-rank AdaLN store (its `blocks.0.adaln_proj.linear.weight` is `[out, R]`, not
+2688 wide) carries `adaln_basis` [R, 2688], `adaln_cbias` [R] and per-block `adaln_proj` weights [out, R]; the rank is read
+from the store, so no variable is needed.
+
 First/last-frame conditioning is persistent in the session:
 
 ```text

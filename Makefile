@@ -52,6 +52,9 @@ h3_text_tests: tests/test_text_metal.o $(LIB_OBJ)
 h3_audio_gpu_tests: tests/test_audio_gpu.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_beta57_test: tests/test_beta57.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_real_audio_vae_test: tests/test_real_audio_vae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 

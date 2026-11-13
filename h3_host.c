@@ -163,6 +163,69 @@ int h3_schedule_build(int steps, h3_sigma_schedule *schedule) {
     return 1;
 }
 
+static double h3_betacf(double a, double b, double x) {
+    const double tiny = 1e-300;
+    double qab = a + b, qap = a + 1.0, qam = a - 1.0;
+    double c = 1.0, d = 1.0 - qab * x / qap;
+    if (fabs(d) < tiny) d = tiny;
+    d = 1.0 / d;
+    double h = d;
+    for (int m = 1; m <= 300; m++) {
+        double m2 = 2.0 * m;
+        double aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + aa * d;
+        if (fabs(d) < tiny) d = tiny;
+        c = 1.0 + aa / c;
+        if (fabs(c) < tiny) c = tiny;
+        d = 1.0 / d;
+        h *= d * c;
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa * d;
+        if (fabs(d) < tiny) d = tiny;
+        c = 1.0 + aa / c;
+        if (fabs(c) < tiny) c = tiny;
+        d = 1.0 / d;
+        double del = d * c;
+        h *= del;
+        if (fabs(del - 1.0) < 3e-16) break;
+    }
+    return h;
+}
+
+double h3_beta_cdf(double x, double a, double b) {
+    if (x <= 0.0) return 0.0;
+    if (x >= 1.0) return 1.0;
+    double log_front = lgamma(a + b) - lgamma(a) - lgamma(b) +
+                       a * log(x) + b * log(1.0 - x);
+    double front = exp(log_front);
+    if (x < (a + 1.0) / (a + b + 2.0)) return front * h3_betacf(a, b, x) / a;
+    return 1.0 - front * h3_betacf(b, a, 1.0 - x) / b;
+}
+
+double h3_beta_ppf(double q, double a, double b) {
+    if (q <= 0.0) return 0.0;
+    if (q >= 1.0) return 1.0;
+    double lo = 0.0, hi = 1.0;
+    for (int iteration = 0; iteration < 60; iteration++) {
+        double mid = 0.5 * (lo + hi);
+        if (h3_beta_cdf(mid, a, b) < q) lo = mid; else hi = mid;
+    }
+    return 0.5 * (lo + hi);
+}
+
+static int h3_scheduler_is_beta57(void) {
+    const char *value = getenv("H3_SCHEDULER");
+    return value && strcmp(value, "beta57") == 0;
+}
+
+/* ComfyUI beta scheduler (alpha 0.5, beta 0.7) on the 1000-step grid. */
+static float h3_beta57_base(int steps, int index) {
+    if (index >= steps) return 0.0f;
+    double q = 1.0 - (double)index / (double)steps;
+    double t = nearbyint(h3_beta_ppf(q, 0.5, 0.7) * 999.0);
+    return (float)((t + 1.0) / 1000.0);
+}
+
 int h3_renoise_enabled(void) {
     const char *value = getenv("H3_RENOISE");
     return value && *value && strcmp(value, "0");
@@ -172,6 +235,7 @@ int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
     if (!schedule || evaluations < 2 || evaluations > H3_MAX_STEPS) return 0;
     memset(schedule, 0, sizeof(*schedule));
     schedule->steps = evaluations;
+    int beta57 = h3_scheduler_is_beta57();
     if (h3_renoise_enabled()) {
         static const float knots[7] = {1000, 750, 500, 250, 100, 40, 0};
         for (int index = 0; index <= evaluations; index++) {
@@ -180,7 +244,7 @@ int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
             int lo = (int)at;
             if (lo > 5) lo = 5;
             float knot = knots[lo] + (knots[lo + 1] - knots[lo]) * (at - (float)lo);
-            float base = knot / 1000.0f;
+            float base = beta57 ? h3_beta57_base(evaluations, index) : knot / 1000.0f;
             float vs = (float)h3_video_sigma_shift();
             float as = (float)h3_audio_sigma_shift();
             schedule->video[index] = vs * base / (1.0f + (vs - 1.0f) * base);
@@ -190,7 +254,8 @@ int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
     }
     float denominator = (float)evaluations;
     for (int index = 0; index <= evaluations; index++) {
-        float base = 1.0f - (float)index / denominator;
+        float base = beta57 ? h3_beta57_base(evaluations, index)
+                            : 1.0f - (float)index / denominator;
         schedule->video[index] = (float)h3_video_sigma_shift() * base /
             (1.0f + ((float)h3_video_sigma_shift() - 1.0f) * base);
         schedule->audio[index] = (float)h3_audio_sigma_shift() * base /
