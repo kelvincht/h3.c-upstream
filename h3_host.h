@@ -116,8 +116,12 @@ double h3_audio_sigma_shift(void);
 double h3_time_shift_sigma(double sigma, double from_shift, double to_shift);
 double h3_time_shift_slope(double sigma, double from_shift, double to_shift);
 int h3_schedule_build(int steps, h3_sigma_schedule *schedule);
-/* Released linear base grid: evaluations model forwards plus terminal zero. */
+/* Released linear base grid: evaluations model forwards plus terminal zero.
+ * H3_SCHEDULER=beta57 swaps the base grid for the ComfyUI beta(0.5, 0.7)
+ * grid on the 1000-step scale; the shift map and renoise stepping are kept. */
 int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule);
+double h3_beta_cdf(double x, double a, double b);
+double h3_beta_ppf(double q, double a, double b);
 /* H3_RENOISE=1: Pika H3 Flex sampling. Six forwards on knots
  * 1000/750/500/250/100/40/0 (shifted by video/audio shift), each step jumping
  * to the clean estimate and re-noising with fresh noise. */
