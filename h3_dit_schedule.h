@@ -19,10 +19,8 @@ typedef struct h3_dit_schedule h3_dit_schedule;
 typedef void (*h3_dit_schedule_progress)(int completed_blocks,
                                          int total_blocks, void *opaque);
 
-/* Opt-in experiment switches (env "=1"), read by the schedule builder and by the disk-cache
- * key so variants never share a cached schedule. Both need a low-rank AdaLN store. */
-int h3_dit_adaln_table_enabled(void);       /* H3_ADALN_TABLE: coefficients from adaln_t_table */
-int h3_dit_adaln_final_full_enabled(void);  /* H3_ADALN_FINAL_FULL: final layer from full-rank proj */
+/* H3_ADALN_TABLE=1 (low-rank stores): read by the schedule builder and the disk-cache key. */
+int h3_dit_adaln_table_enabled(void);
 
 /* Materialize every per-step AdaLN value. This intentionally submits one
  * projection at a time, so a 498 MiB block projection is released before the

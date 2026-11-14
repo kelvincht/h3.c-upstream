@@ -27,9 +27,6 @@ static int env_switch(const char *name) {
 }
 
 int h3_dit_adaln_table_enabled(void) { return env_switch("H3_ADALN_TABLE"); }
-int h3_dit_adaln_final_full_enabled(void) {
-    return env_switch("H3_ADALN_FINAL_FULL");
-}
 
 struct h3_dit_schedule {
     h3_gpu *gpu;
@@ -335,15 +332,8 @@ h3_dit_schedule *h3_dit_schedule_precompute(
     }
     uint32_t rank = adaln_rank(weights);
     int table = h3_dit_adaln_table_enabled();
-    int final_full = h3_dit_adaln_final_full_enabled();
-    if ((table || final_full) && !rank) {
-        fail(error, error_size, "H3_ADALN_TABLE and H3_ADALN_FINAL_FULL need a low-rank AdaLN store");
-        return NULL;
-    }
-    if (final_full && (!h3_weight_find(weights,
-            "final_layer.adaln_proj_full.linear.weight", NULL) ||
-        !h3_weight_find(weights, "final_layer.adaln_proj_full.linear.bias", NULL))) {
-        fail(error, error_size, "H3_ADALN_FINAL_FULL: store has no final_layer.adaln_proj_full tensors");
+    if (table && !rank) {
+        fail(error, error_size, "H3_ADALN_TABLE needs a low-rank AdaLN store");
         return NULL;
     }
     h3_dit_schedule *schedule = calloc(1, sizeof(*schedule));
@@ -448,16 +438,11 @@ h3_dit_schedule *h3_dit_schedule_precompute(
                                progress_opaque);
     }
 
-    /* H3_ADALN_FINAL_FULL: the final layer projects the full-rank time vector. */
-    const h3_gpu_tensor *final_input = final_full ? time : modulation_input;
-    uint32_t final_dim = final_full ? H3_DIT_TIME_DIM : modulation_dim;
     h3_gpu_tensor *final_w = weight_bf16_2d(
-        weights, gpu, final_full ? "final_layer.adaln_proj_full.linear.weight"
-                                 : "final_layer.adaln_proj.linear.weight",
-        FINAL_OUTPUT, final_dim, error, error_size);
+        weights, gpu, "final_layer.adaln_proj.linear.weight",
+        FINAL_OUTPUT, modulation_dim, error, error_size);
     h3_gpu_tensor *final_b = weight_bf16_1d(
-        weights, gpu, final_full ? "final_layer.adaln_proj_full.linear.bias"
-                                 : "final_layer.adaln_proj.linear.bias",
+        weights, gpu, "final_layer.adaln_proj.linear.bias",
         FINAL_OUTPUT, error, error_size);
     schedule->final = h3_gpu_tensor_new_bf16(
         gpu, (size_t)schedule->time_rows * FINAL_OUTPUT);
@@ -465,8 +450,8 @@ h3_dit_schedule *h3_dit_schedule_precompute(
         !gpu_op(gpu, h3_gpu_begin(gpu), error, error_size,
                 "begin final AdaLN") ||
         !gpu_op(gpu, h3_gpu_linear_bf16(
-            gpu, schedule->final, final_input, final_w, final_b,
-            schedule->time_rows, final_dim, FINAL_OUTPUT), error, error_size,
+            gpu, schedule->final, modulation_input, final_w, final_b,
+            schedule->time_rows, modulation_dim, FINAL_OUTPUT), error, error_size,
             "final AdaLN projection") ||
         !gpu_op(gpu, h3_gpu_submit(gpu), error, error_size,
                 "submit final AdaLN")) {
