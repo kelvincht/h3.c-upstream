@@ -1835,7 +1835,8 @@ static void adopt_core(h3_dit *dit, h3_dit *core) {
     dit->core_adopted = 1;
 }
 
-#define ADALN_KEY_BYTES (1024 + 3 * sizeof(int32_t) + 2 * (H3_MAX_STEPS + 1) * sizeof(float))
+/* +32 leaves room for the optional "|table" variant suffix. */
+#define ADALN_KEY_BYTES (1024 + 3 * sizeof(int32_t) + 2 * (H3_MAX_STEPS + 1) * sizeof(float) + 32)
 
 /* Cache key for the AdaLN schedule: the checkpoint directory plus everything the schedule reads. */
 static size_t adaln_key_build(const h3_dit *dit, const h3_sigma_schedule *sigmas,
@@ -1848,7 +1849,13 @@ static size_t adaln_key_build(const h3_dit *dit, const h3_sigma_schedule *sigmas
     memcpy(key + 1024 + sizeof(header), sigmas->video, points * sizeof(float));
     memcpy(key + 1024 + sizeof(header) + points * sizeof(float), sigmas->audio,
            points * sizeof(float));
-    return 1024 + sizeof(header) + 2 * points * sizeof(float);
+    size_t bytes = 1024 + sizeof(header) + 2 * points * sizeof(float);
+    /* Variant suffixes are appended only when set, so default keys are unchanged. */
+    if (h3_dit_adaln_table_enabled()) {
+        memcpy(key + bytes, "|table", 6);
+        bytes += 6;
+    }
+    return bytes;
 }
 
 static h3_dit *load_dit(const char *weight_directory,

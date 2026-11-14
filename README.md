@@ -49,6 +49,11 @@ shift map and renoise are unchanged). A low-rank AdaLN store (its `blocks.0.adal
 2688 wide) carries `adaln_basis` [R, 2688], `adaln_cbias` [R] and per-block `adaln_proj` weights [out, R]; the rank is read
 from the store, so no variable is needed.
 
+`H3_ADALN_TABLE=1` (low-rank stores only) replaces the basis projection with a lookup: the per-step coefficients are
+linearly interpolated from the store's `adaln_t_table` F32 [1025, R] at `t * 1024` (rows for t = 0, 1/1024, ..., 1), so
+the table, not `adaln_basis`, sets the time conditioning. Setting it without a low-rank store fails at load. The AdaLN
+disk cache key gets a `|table` suffix so table and basis schedules never share a cache entry.
+
 First/last-frame conditioning is persistent in the session:
 
 ```text
