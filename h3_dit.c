@@ -1535,6 +1535,11 @@ static int int8_cache_open(h3_dit *dit, const char *path, uint64_t stamp,
         have.complete == 1 &&
         strcmp(have.weight_directory, want.weight_directory) == 0 &&
         int8_cache_size_ok(file, have.active_mask)) {
+        dit->int8_cache_path = strdup(path);  /* drop() unlinks through this on a read failure */
+        if (!dit->int8_cache_path) {  /* cannot name the file: continue uncached */
+            fclose(file);
+            return 1;
+        }
         dit->int8_cache = file;
         dit->int8_cache_loading = 1;
         return 1;
@@ -1565,7 +1570,8 @@ static int int8_cache_open(h3_dit *dit, const char *path, uint64_t stamp,
 }
 
 /* Gives up on the cache for this load; the load continues uncached. A read failure removes the
- * bad file so the next load rebuilds it; a write failure removes the partial temp file. */
+ * bad file (load_core only calls this when the store can rebuild it); a write failure removes
+ * the partial temp file. */
 static void int8_cache_drop(h3_dit *dit) {
     if (!dit->int8_cache) return;
     fclose(dit->int8_cache);
@@ -1701,7 +1707,17 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                 if (!load_block_norms(dit, &dit->blocks[index], prefix,
                                       error, error_size)) return 0;
                 cached = int8_cache_block(dit, &dit->blocks[index], 1);
-                if (!cached) {  /* unreadable cache is a miss: rebuild this block uncached */
+                if (!cached) {
+                    if (!h3_weight_find(dit->weights, "blocks.0.mlp.fc1.weight", NULL)) {
+                        /* Slim store: nothing to rebuild from, so the cache is the only int8
+                         * copy. Close it without unlinking and fail the load. */
+                        fclose(dit->int8_cache);
+                        dit->int8_cache = NULL;
+                        dit->int8_cache_loading = 0;
+                        fail(error, error_size, "DiT int8 cache read failed");
+                        return 0;
+                    }
+                    /* BF16 store: an unreadable cache is a miss; rebuild this block uncached */
                     int8_cache_drop(dit);
                     free_block(&dit->blocks[index]);
                 }
