@@ -1553,40 +1553,46 @@ static int int8_cache_open(h3_dit *dit, const char *path, uint64_t stamp,
         snprintf(dit->int8_cache_temp, temp_bytes, "%s.%ld.tmp", path, (long)getpid());
     file = dit->int8_cache_path && dit->int8_cache_temp ?
         fopen(dit->int8_cache_temp, "wb") : NULL;
-    if (!file || fwrite(&want, sizeof(want), 1, file) != 1) {
-        if (file) {
-            fclose(file);
-            unlink(dit->int8_cache_temp);
-        }
-        fail(error, error_size, "cannot create DiT int8 cache %s", path);
-        return 0;
+    if (!file) return 1;  /* cannot create the cache: continue uncached */
+    if (fwrite(&want, sizeof(want), 1, file) != 1) {
+        fclose(file);
+        unlink(dit->int8_cache_temp);
+        return 1;
     }
     dit->int8_cache = file;
     dit->int8_cache_loading = 0;
     return 1;
 }
 
-static int int8_cache_finish(h3_dit *dit) {
-    if (!dit->int8_cache) return 1;
-    int ok = 1;
-    if (!dit->int8_cache_loading) {
-        uint32_t complete = 1;
-        ok = fseek(dit->int8_cache, (long)offsetof(int8_cache_header, complete),
+/* Gives up on the cache for this load; the load continues uncached. A read failure removes the
+ * bad file so the next load rebuilds it; a write failure removes the partial temp file. */
+static void int8_cache_drop(h3_dit *dit) {
+    if (!dit->int8_cache) return;
+    fclose(dit->int8_cache);
+    dit->int8_cache = NULL;
+    unlink(dit->int8_cache_loading ? dit->int8_cache_path : dit->int8_cache_temp);
+    dit->int8_cache_loading = 0;
+}
+
+static void int8_cache_finish(h3_dit *dit) {
+    if (!dit->int8_cache) return;
+    if (dit->int8_cache_loading) {
+        fclose(dit->int8_cache);
+        dit->int8_cache = NULL;
+        return;
+    }
+    uint32_t complete = 1;
+    int ok = fseek(dit->int8_cache, (long)offsetof(int8_cache_header, complete),
                    SEEK_SET) == 0 &&
              fwrite(&complete, sizeof(complete), 1, dit->int8_cache) == 1;
-    }
     ok = fclose(dit->int8_cache) == 0 && ok;
     dit->int8_cache = NULL;
-    if (!dit->int8_cache_loading) {
-        if (ok) ok = rename(dit->int8_cache_temp, dit->int8_cache_path) == 0;
-        if (!ok) unlink(dit->int8_cache_temp);
-    }
-    return ok;
+    if (ok) ok = rename(dit->int8_cache_temp, dit->int8_cache_path) == 0;
+    if (!ok) unlink(dit->int8_cache_temp);
 }
 
 /* Writes one block's int8 weights and scales, or reads them back and allocates the GPU tensors. */
-static int int8_cache_block(h3_dit *dit, h3_dit_block *block, int loading,
-                            char *error, size_t error_size) {
+static int int8_cache_block(h3_dit *dit, h3_dit_block *block, int loading) {
     struct { h3_gpu_tensor **data, **scales; size_t bytes, scale_count; } parts[4] = {
         {&block->fc1_int8, &block->fc1_scales, 2u * FFN * HIDDEN, FFN * 2u},
         {&block->fc2_int8, &block->fc2_scales, (size_t)HIDDEN * FFN, HIDDEN},
@@ -1617,8 +1623,19 @@ static int int8_cache_block(h3_dit *dit, h3_dit_block *block, int loading,
     }
     free(bytes);
     free(scales);
-    if (!ok) fail(error, error_size, "DiT int8 cache %s failed", loading ? "read" : "write");
     return ok;
+}
+
+static int load_block_uncached(h3_dit *dit, h3_dit_block *block, const char *prefix,
+                               char *error, size_t error_size) {
+    if (!load_block(dit, block, prefix, error, error_size)) return 0;
+    if (dit->int8_mlp &&
+        !quantize_block_mlp(dit, block, error, error_size)) return 0;
+    if (dit->int8_qkv &&
+        !quantize_block_qkv(dit, block, error, error_size)) return 0;
+    if (dit->int8_attention_out &&
+        !quantize_block_attention_out(dit, block, error, error_size)) return 0;
+    return 1;
 }
 
 static int path_ends_with(const char *path, const char *suffix) {
@@ -1678,34 +1695,28 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                                   error, error_size) ||
                 !prepare_stream_layer(dit, index, error, error_size))
                 return 0;
-        } else if (dit->int8_cache && dit->int8_cache_loading) {
-            if (!load_block_norms(dit, &dit->blocks[index], prefix,
-                                  error, error_size) ||
-                !int8_cache_block(dit, &dit->blocks[index], 1,
-                                  error, error_size)) return 0;
         } else {
-            if (!load_block(dit, &dit->blocks[index], prefix,
-                            error, error_size)) return 0;
-            if (dit->int8_mlp &&
-                !quantize_block_mlp(dit, &dit->blocks[index],
-                                    error, error_size)) return 0;
-            if (dit->int8_qkv &&
-                !quantize_block_qkv(dit, &dit->blocks[index],
-                                    error, error_size)) return 0;
-            if (dit->int8_attention_out &&
-                !quantize_block_attention_out(
-                    dit, &dit->blocks[index], error, error_size)) return 0;
-            if (dit->int8_cache &&
-                !int8_cache_block(dit, &dit->blocks[index], 0,
-                                  error, error_size)) return 0;
+            int cached = 0;
+            if (dit->int8_cache && dit->int8_cache_loading) {
+                if (!load_block_norms(dit, &dit->blocks[index], prefix,
+                                      error, error_size)) return 0;
+                cached = int8_cache_block(dit, &dit->blocks[index], 1);
+                if (!cached) {  /* unreadable cache is a miss: rebuild this block uncached */
+                    int8_cache_drop(dit);
+                    free_block(&dit->blocks[index]);
+                }
+            }
+            if (!cached) {
+                if (!load_block_uncached(dit, &dit->blocks[index], prefix,
+                                         error, error_size)) return 0;
+                if (dit->int8_cache && !int8_cache_block(dit, &dit->blocks[index], 0))
+                    int8_cache_drop(dit);
+            }
         }
         report(progress, opaque, "load transformer core", (int)index + 1,
                H3_DIT_BLOCKS);
     }
-    if (!int8_cache_finish(dit)) {
-        fail(error, error_size, "cannot finish DiT int8 cache");
-        return 0;
-    }
+    int8_cache_finish(dit);
     if (dit->ssd_streaming) {
         if (!allocate_stream_slot(dit, &dit->stream_slots[0],
                                   error, error_size) ||
