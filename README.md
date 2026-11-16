@@ -40,8 +40,9 @@ are `!status`, `!seed random`, `!seconds 2`, `!show`, `!save output.mp4`, `!cach
 Use `!help` for the full, short list.
 
 Two on-disk caches are opt-in environment variables: `H3_DIT_INT8_CACHE=<file>` writes the int8 DiT core once and reads it on
-later loads (delete it after the checkpoint changes), and `H3_ADALN_CACHE_DIR=<dir>` stores the AdaLN schedule per checkpoint,
-steps, sigmas and condition rows, capped at 10 GiB with least-recently-used eviction.
+later loads, and `H3_ADALN_CACHE_DIR=<dir>` stores the AdaLN schedule per checkpoint, steps, sigmas and condition rows, capped
+at 10 GiB with least-recently-used eviction. Both key on the checkpoint path and each shard's size and mtime, so replacing
+weights in place rebuilds them.
 
 The int8 cache is per pipeline: the file used is the given path plus `.ref2va` or `.fl2va`, chosen by the transformer
 directory. `H3_SCHEDULER=beta57` selects the ComfyUI beta(0.5, 0.7) sigma grid instead of the released linear grid (the

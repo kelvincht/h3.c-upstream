@@ -3,6 +3,7 @@
 #include "h3_dit_schedule.h"
 #include "h3_weights.h"
 
+#include <dirent.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -10,7 +11,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 enum {
     TEXT_DIM = 5120,
@@ -82,6 +85,8 @@ struct h3_dit {
     int keep_bf16_attention_out;
     FILE *int8_cache;       /* per-fold int8 core file, read or written by load_core */
     int int8_cache_loading;
+    char *int8_cache_path;  /* final cache file; a write lands in int8_cache_temp first */
+    char *int8_cache_temp;
     int use_slower_row_major_attention_output;
     int use_slower_unfused_int8_inputs;
     int use_slower_unfused_qkv_rope;
@@ -1437,19 +1442,78 @@ static void configure_gate_ranked_blocks(h3_dit *dit) {
 /* Per-fold int8 core cache. The int8 weights and f32 scales that quantize_block_* build from the
  * BF16 checkpoint are fixed per checkpoint, so H3_DIT_INT8_CACHE=<file> writes them once and reads
  * them on later loads. A file is used only when its header matches this weight directory, the
- * dimensions and the active blocks, and it is marked complete. Delete it after the checkpoint changes. */
+ * stamp of its shards, the dimensions and the active blocks, it is marked complete, and its size
+ * is exactly one record per active block. A write goes to a per-process temp file renamed into
+ * place when complete. */
 #define INT8_CACHE_MAGIC 0x48334938u /* "H3I8" */
-#define INT8_CACHE_VERSION 1u
+#define INT8_CACHE_VERSION 2u
 #define INT8_CACHE_PATH_BYTES 1024u
 
 typedef struct {
     uint32_t magic, version, hidden, inner, ffn, blocks;
     uint64_t active_mask;
+    uint64_t weights_stamp;
     uint32_t complete;
     char weight_directory[INT8_CACHE_PATH_BYTES];
 } int8_cache_header;
 
-static int int8_cache_open(h3_dit *dit, const char *path,
+static uint64_t fnv1a_update(uint64_t hash, const void *data, size_t bytes) {
+    const unsigned char *in = data;
+    for (size_t index = 0; index < bytes; index++) {
+        hash ^= in[index];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+/* Fingerprint of every safetensors shard the weight store opens: name, size and mtime. Per-shard
+ * hashes are summed, so readdir order does not matter; replacing a shard in place changes the
+ * stamp. Returns 0 when the directory or a shard cannot be read, and callers then skip the cache. */
+static int weights_stamp(const char *directory, uint64_t *stamp) {
+    DIR *dir = directory ? opendir(directory) : NULL;
+    if (!dir) return 0;
+    const char suffix[] = ".safetensors";
+    size_t suffix_length = sizeof(suffix) - 1;
+    uint64_t sum = 0;
+    int ok = 1;
+    for (struct dirent *entry; ok && (entry = readdir(dir));) {
+        size_t length = strlen(entry->d_name);
+        if (length <= suffix_length ||
+            strcmp(entry->d_name + length - suffix_length, suffix) != 0)
+            continue;
+        size_t path_bytes = strlen(directory) + length + 2;
+        char *path = malloc(path_bytes);
+        struct stat info;
+        if (path) snprintf(path, path_bytes, "%s/%s", directory, entry->d_name);
+        ok = path && stat(path, &info) == 0;
+        free(path);
+        if (!ok) break;
+        int64_t fields[3] = {(int64_t)info.st_size, (int64_t)info.st_mtimespec.tv_sec,
+                             (int64_t)info.st_mtimespec.tv_nsec};
+        uint64_t hash = fnv1a_update(1469598103934665603ull, entry->d_name, length);
+        sum += fnv1a_update(hash, fields, sizeof(fields));
+    }
+    closedir(dir);
+    if (ok) *stamp = sum;
+    return ok;
+}
+
+/* A complete file holds exactly its header plus one record per active block. */
+static int int8_cache_size_ok(FILE *file, uint64_t active_mask) {
+    size_t blocks = 0;
+    for (unsigned index = 0; index < H3_DIT_BLOCKS; index++)
+        blocks += (size_t)((active_mask >> index) & 1u);
+    size_t per_block = (size_t)2 * FFN * HIDDEN + (size_t)HIDDEN * FFN +
+                       (size_t)3 * INNER * HIDDEN + (size_t)HIDDEN * INNER +
+                       ((size_t)2 * FFN + HIDDEN + (size_t)3 * INNER + HIDDEN) * sizeof(float);
+    if (fseeko(file, 0, SEEK_END) != 0) return 0;
+    off_t end = ftello(file);
+    if (fseeko(file, (off_t)sizeof(int8_cache_header), SEEK_SET) != 0) return 0;
+    return end >= 0 && (size_t)end == sizeof(int8_cache_header) + blocks * per_block;
+}
+
+/* The caller guarantees weight_directory fits INT8_CACHE_PATH_BYTES and has a weights stamp. */
+static int int8_cache_open(h3_dit *dit, const char *path, uint64_t stamp,
                            char *error, size_t error_size) {
     int8_cache_header want;
     memset(&want, 0, sizeof(want));
@@ -1461,11 +1525,7 @@ static int int8_cache_open(h3_dit *dit, const char *path,
     want.blocks = H3_DIT_BLOCKS;
     for (unsigned index = 0; index < H3_DIT_BLOCKS; index++)
         if (dit->block_active[index]) want.active_mask |= 1ull << index;
-    if (!dit->weight_directory ||
-        strlen(dit->weight_directory) >= INT8_CACHE_PATH_BYTES) {
-        fail(error, error_size, "DiT int8 cache: weight directory path too long");
-        return 0;
-    }
+    want.weights_stamp = stamp;
     strcpy(want.weight_directory, dit->weight_directory);
 
     int8_cache_header have;
@@ -1473,7 +1533,8 @@ static int int8_cache_open(h3_dit *dit, const char *path,
     if (file && fread(&have, sizeof(have), 1, file) == 1 &&
         memcmp(&have, &want, offsetof(int8_cache_header, complete)) == 0 &&
         have.complete == 1 &&
-        strcmp(have.weight_directory, want.weight_directory) == 0) {
+        strcmp(have.weight_directory, want.weight_directory) == 0 &&
+        int8_cache_size_ok(file, have.active_mask)) {
         dit->int8_cache = file;
         dit->int8_cache_loading = 1;
         return 1;
@@ -1485,9 +1546,18 @@ static int int8_cache_open(h3_dit *dit, const char *path,
              path, dit->weight_directory);
         return 0;
     }
-    file = fopen(path, "wb");
+    size_t temp_bytes = strlen(path) + 32;
+    dit->int8_cache_path = strdup(path);
+    dit->int8_cache_temp = malloc(temp_bytes);
+    if (dit->int8_cache_temp)
+        snprintf(dit->int8_cache_temp, temp_bytes, "%s.%ld.tmp", path, (long)getpid());
+    file = dit->int8_cache_path && dit->int8_cache_temp ?
+        fopen(dit->int8_cache_temp, "wb") : NULL;
     if (!file || fwrite(&want, sizeof(want), 1, file) != 1) {
-        if (file) fclose(file);
+        if (file) {
+            fclose(file);
+            unlink(dit->int8_cache_temp);
+        }
         fail(error, error_size, "cannot create DiT int8 cache %s", path);
         return 0;
     }
@@ -1507,6 +1577,10 @@ static int int8_cache_finish(h3_dit *dit) {
     }
     ok = fclose(dit->int8_cache) == 0 && ok;
     dit->int8_cache = NULL;
+    if (!dit->int8_cache_loading) {
+        if (ok) ok = rename(dit->int8_cache_temp, dit->int8_cache_path) == 0;
+        if (!ok) unlink(dit->int8_cache_temp);
+    }
     return ok;
 }
 
@@ -1579,12 +1653,15 @@ static char *int8_cache_pipeline_path(const char *base, const char *weight_direc
 static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                      char *error, size_t error_size) {
     const char *cache_base = getenv("H3_DIT_INT8_CACHE");
+    uint64_t stamp = 0;
     if (cache_base && *cache_base && !dit->ssd_streaming &&
         dit->int8_mlp && dit->int8_qkv && dit->int8_attention_out &&
-        !dit->keep_bf16_mlp && !dit->keep_bf16_qkv && !dit->keep_bf16_attention_out) {
+        !dit->keep_bf16_mlp && !dit->keep_bf16_qkv && !dit->keep_bf16_attention_out &&
+        strlen(dit->weight_directory) < INT8_CACHE_PATH_BYTES &&
+        weights_stamp(dit->weight_directory, &stamp)) {
         char *cache_path = int8_cache_pipeline_path(
             cache_base, dit->weight_directory, error, error_size);
-        int ok = cache_path && int8_cache_open(dit, cache_path, error, error_size);
+        int ok = cache_path && int8_cache_open(dit, cache_path, stamp, error, error_size);
         free(cache_path);
         if (!ok) return 0;
     }
@@ -2027,27 +2104,35 @@ static void adopt_core(h3_dit *dit, h3_dit *core) {
     dit->core_adopted = 1;
 }
 
-/* +32 leaves room for the optional "|table" variant suffix. */
-#define ADALN_KEY_BYTES (1024 + 3 * sizeof(int32_t) + 2 * (H3_MAX_STEPS + 1) * sizeof(float) + 32)
+/* Bump when the AdaLN schedule math changes (full, low-rank or table form), so schedules cached
+ * by older code miss. */
+#define ADALN_SCHEDULE_VERSION 1u
 
-/* Cache key for the AdaLN schedule: the checkpoint directory plus everything the schedule reads. */
-static size_t adaln_key_build(const h3_dit *dit, const h3_sigma_schedule *sigmas,
-                              int visual, int audio, unsigned char *key) {
-    memset(key, 0, ADALN_KEY_BYTES);
-    snprintf((char *)key, 1024, "%s", dit->weight_directory ? dit->weight_directory : "");
-    int32_t header[3] = {sigmas->steps, visual, audio};
+/* Cache key for the AdaLN schedule: everything the schedule reads, including the stamp of the
+ * weight shards (which also tells a low-rank store from a full one), the dimensions and the
+ * full checkpoint path. Returns a malloc'd key, or NULL when it cannot be built; the caller then
+ * computes the schedule without the cache. */
+static unsigned char *adaln_key_build(const h3_dit *dit, const h3_sigma_schedule *sigmas,
+                                      int visual, int audio, size_t *bytes) {
+    uint64_t stamp;
+    if (!dit->weight_directory || !weights_stamp(dit->weight_directory, &stamp)) return NULL;
+    uint32_t header[11] = {
+        ADALN_SCHEDULE_VERSION, (uint32_t)sigmas->steps, (uint32_t)visual, (uint32_t)audio,
+        (uint32_t)h3_dit_adaln_table_enabled(), TEXT_DIM, H3_DIT_TIME_DIM, H3_DIT_HIDDEN,
+        H3_DIT_MODALITIES * H3_DIT_ADALN_SLOTS * H3_DIT_HIDDEN, FINAL_SLOTS * H3_DIT_HIDDEN,
+        (uint32_t)strlen(dit->weight_directory)};
     size_t points = (size_t)sigmas->steps + 1;
-    memcpy(key + 1024, header, sizeof(header));
-    memcpy(key + 1024 + sizeof(header), sigmas->video, points * sizeof(float));
-    memcpy(key + 1024 + sizeof(header) + points * sizeof(float), sigmas->audio,
-           points * sizeof(float));
-    size_t bytes = 1024 + sizeof(header) + 2 * points * sizeof(float);
-    /* Variant suffixes are appended only when set, so default keys are unchanged. */
-    if (h3_dit_adaln_table_enabled()) {
-        memcpy(key + bytes, "|table", 6);
-        bytes += 6;
-    }
-    return bytes;
+    size_t sigma_bytes = points * sizeof(float);
+    size_t total = sizeof(header) + sizeof(stamp) + header[10] + 2 * sigma_bytes;
+    unsigned char *key = malloc(total), *at = key;
+    if (!key) return NULL;
+    memcpy(at, header, sizeof(header)); at += sizeof(header);
+    memcpy(at, &stamp, sizeof(stamp)); at += sizeof(stamp);
+    memcpy(at, dit->weight_directory, header[10]); at += header[10];
+    memcpy(at, sigmas->video, sigma_bytes); at += sigma_bytes;
+    memcpy(at, sigmas->audio, sigma_bytes);
+    *bytes = total;
+    return key;
 }
 
 static h3_dit *load_dit(const char *weight_directory,
@@ -2185,17 +2270,20 @@ static h3_dit *load_dit(const char *weight_directory,
         core->schedule = NULL;
         fprintf(stderr, "h3: AdaLN schedule retained with the core\n");
     } else {
-        /* H3_ADALN_CACHE_DIR: the AdaLN schedule is keyed by checkpoint directory, steps,
-         * sigmas and condition rows (not seed or prompt), so a repeat of any of those is a hit. */
-        unsigned char adaln_key[ADALN_KEY_BYTES];
-        size_t adaln_key_bytes = adaln_key_build(
-            dit, sigmas, dit->video_condition_rows != 0,
-            dit->audio_condition_rows != 0, adaln_key);
+        /* H3_ADALN_CACHE_DIR: the AdaLN schedule is keyed by checkpoint (path and shard stamp),
+         * steps, sigmas and condition rows (not seed or prompt), so a repeat of those is a hit. */
+        const char *adaln_cache_dir = getenv("H3_ADALN_CACHE_DIR");
+        size_t adaln_key_bytes = 0;
+        unsigned char *adaln_key = NULL;
+        if (adaln_cache_dir && *adaln_cache_dir)
+            adaln_key = adaln_key_build(dit, sigmas, dit->video_condition_rows != 0,
+                                        dit->audio_condition_rows != 0, &adaln_key_bytes);
         dit->schedule = h3_dit_schedule_cached(
-            getenv("H3_ADALN_CACHE_DIR"), (const char *)adaln_key, adaln_key_bytes,
+            adaln_cache_dir, (const char *)adaln_key, adaln_key_bytes,
             dit->weights, dit->gpu, sigmas, dit->video_condition_rows != 0,
             dit->audio_condition_rows != 0, schedule_report, &schedule_state,
             error, error_size);
+        free(adaln_key);
     }
     if (dit->schedule) {
         configure_gate_ranked_blocks(dit);
@@ -3684,7 +3772,12 @@ int h3_dit_core_adopted(const h3_dit *dit) {
 
 void h3_dit_free(h3_dit *dit) {
     if (!dit) return;
-    if (dit->int8_cache) fclose(dit->int8_cache);  /* a load that failed mid-cache */
+    if (dit->int8_cache) {  /* a load that failed mid-cache */
+        fclose(dit->int8_cache);
+        if (!dit->int8_cache_loading) unlink(dit->int8_cache_temp);
+    }
+    free(dit->int8_cache_path);
+    free(dit->int8_cache_temp);
     free_step_maps(dit);
     free_tensor(&dit->refined_text);
     free_tensor(&dit->rope_cos);

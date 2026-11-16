@@ -629,7 +629,7 @@ int h3_dit_schedule_row_map(const h3_dit_schedule *schedule, int step,
  * The full key is stored in the file and compared on load, so a hash collision cannot hit.
  * The directory is capped at ADALN_CACHE_MAX_BYTES; the least recently used files go first. */
 #define ADALN_CACHE_MAGIC 0x44414833u /* "3HAD" */
-#define ADALN_CACHE_VERSION 1u
+#define ADALN_CACHE_VERSION 2u
 #define ADALN_CACHE_MAX_BYTES (10ull << 30)
 #define ADALN_PATH_BYTES 4096
 
@@ -653,7 +653,8 @@ static int adaln_read_u32(FILE *file, uint32_t *value) {
 static int adaln_save(const h3_dit_schedule *schedule, const char *path,
                       const char *key, size_t key_bytes) {
     char temporary[ADALN_PATH_BYTES];
-    snprintf(temporary, sizeof(temporary), "%s.tmp", path);
+    int written = snprintf(temporary, sizeof(temporary), "%s.%ld.tmp", path, (long)getpid());
+    if (written < 0 || (size_t)written >= sizeof(temporary)) return 0;
     FILE *file = fopen(temporary, "wb");
     if (!file) return 0;
     size_t steps = (size_t)schedule->steps, rows = schedule->time_rows;
@@ -745,6 +746,7 @@ static h3_dit_schedule *adaln_load(h3_gpu *gpu, const char *path,
     }
     size_t final_elements = (size_t)rows * FINAL_OUTPUT;
     if (fread(buffer, sizeof(uint16_t), final_elements, file) != final_elements) goto failed;
+    if (fgetc(file) != EOF) goto failed;  /* trailing bytes: not a file this code wrote */
     schedule->final = h3_gpu_tensor_new_bf16(gpu, final_elements);
     if (!schedule->final ||
         !h3_gpu_tensor_write_bf16(schedule->final, buffer, final_elements))
@@ -818,8 +820,12 @@ h3_dit_schedule *h3_dit_schedule_cached(const char *cache_directory,
                                           audio_condition, progress, progress_opaque,
                                           error, error_size);
     char path[ADALN_PATH_BYTES];
-    snprintf(path, sizeof(path), "%s/%016llx.adaln", cache_directory,
-             (unsigned long long)adaln_fnv1a((const unsigned char *)key, key_bytes));
+    int written = snprintf(path, sizeof(path), "%s/%016llx.adaln", cache_directory,
+                           (unsigned long long)adaln_fnv1a((const unsigned char *)key, key_bytes));
+    if (written < 0 || (size_t)written >= sizeof(path))  /* too long: skip the cache */
+        return h3_dit_schedule_precompute(weights, gpu, sigmas, visual_condition,
+                                          audio_condition, progress, progress_opaque,
+                                          error, error_size);
     h3_dit_schedule *hit = adaln_load(gpu, path, key, key_bytes);
     if (hit) {
         utimes(path, NULL);  /* most recently used */
