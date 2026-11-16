@@ -20,6 +20,11 @@ Accepted naming, all resolved against the checkpoint's own key space:
 Diffusers-layout files (to_q/to_k/to_v, ff.net.*) use split q/k/v and a
 [value;gate] fc1 order; use the ComfyUI conversion of those adapters instead.
 
+Curve branches are skipped: some adapters (e.g. LMS) carry
+blocks.N.adaln_proj.linear pairs whose A takes the 8-dim time curve, not the
+adaln input, so they cannot be folded into the weight. A file must have either
+none of them or exactly one per block (CURVE_PAIRS); any other count aborts.
+
 Requires only numpy. Usage:
   python3 tools/fold_turbo_lora.py \
       --checkpoint MiniMax-H3/Ref2VA/transformer \
@@ -79,6 +84,9 @@ def clone(src, dst):
 SUFFIXES = ((".lora_A.weight", ".lora_B.weight"),
             (".lora_down.weight", ".lora_up.weight"))
 PREFIXES = ("diffusion_model.", "transformer.", "model.")
+CURVE_TARGET = "adaln_proj.linear.weight"
+CURVE_DIM = 8
+CURVE_PAIRS = 50
 
 
 def resolve_target(stem, targets, flattened):
@@ -93,11 +101,13 @@ def resolve_target(stem, targets, flattened):
 
 
 def load_adapter(path, strength, targets):
-    """Return {checkpoint key: (A, B, scale)} for one adapter file."""
+    """Return {checkpoint key: (A, B, scale)} for one adapter file.
+
+    targets maps each checkpoint key to its shape."""
     hlen, header = read_header(path)
     base = 8 + hlen
     flattened = {k[: -len(".weight")].replace(".", "_"): k for k in targets}
-    pairs, unmatched = {}, []
+    pairs, unmatched, curves = {}, [], 0
     for key in header:
         for a_suffix, b_suffix in SUFFIXES:
             if not key.endswith(a_suffix):
@@ -107,8 +117,15 @@ def load_adapter(path, strength, targets):
             if target is None:
                 unmatched.append(stem)
                 continue
+            if target.endswith(CURVE_TARGET) and header[key]["shape"][1] == CURVE_DIM:
+                curves += 1
+                continue
             A = load_tensor(path, header[key], base)
             B = load_tensor(path, header[stem + b_suffix], base)
+            if A.ndim != 2 or B.ndim != 2 or B.shape[1] != A.shape[0] \
+                    or [B.shape[0], A.shape[1]] != list(targets[target]):
+                raise SystemExit(f"{path.name}: {stem}: B{list(B.shape)} @ A{list(A.shape)} "
+                                 f"does not match {target} {list(targets[target])}")
             rank = A.shape[0]
             alpha_info = header.get(stem + ".alpha")
             alpha = float(load_tensor(path, alpha_info, base).reshape(-1)[0]) \
@@ -117,6 +134,11 @@ def load_adapter(path, strength, targets):
     if unmatched:
         raise SystemExit(f"{path.name}: {len(unmatched)} pairs match no checkpoint "
                          f"tensor (first: {unmatched[0]}) - diffusers layout?")
+    if curves not in (0, CURVE_PAIRS):
+        raise SystemExit(f"{path.name}: {curves} adaln_proj curve pairs (A input dim "
+                         f"{CURVE_DIM}); expected 0 or {CURVE_PAIRS}")
+    if curves:
+        print(f"{path.name}: skipped {curves} adaln_proj curve pairs (not foldable)")
     if not pairs:
         raise SystemExit(f"{path.name}: no LoRA pairs found")
     scales = sorted({round(s, 6) for _, _, s in pairs.values()})
@@ -146,9 +168,9 @@ def main():
     shards = sorted(args.checkpoint.glob("model-*.safetensors"))
     if not shards:
         raise SystemExit(f"no shards in {args.checkpoint}")
-    targets = set()
+    targets = {}
     for shard in shards:
-        targets.update(read_header(shard)[1])
+        targets.update({k: v["shape"] for k, v in read_header(shard)[1].items()})
 
     deltas = {}
     for spec in args.lora:
