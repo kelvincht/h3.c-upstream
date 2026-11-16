@@ -97,6 +97,12 @@ h3_dit_bench: tests/bench_dit.o $(LIB_OBJ)
 h3_attn_tiled_bench: tests/bench_attn_tiled.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_sparse_attn_test: tests/test_sparse_attn.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_sparse_attn_check: tests/check_sparse_attn.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_dit_bench_864: tests/bench_dit_864.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
@@ -224,5 +230,6 @@ clean:
 		h3_real_multimodal_text_test h3_real_ref_video_text_test \
 		h3_real_dit_schedule_test h3_real_dit_test h3_semantic_dit_test \
 		h3_real_video_vae_test h3_semantic_vae_test \
-	h3_dit_bench h3_dit_bench_864 h3_attn_tiled_bench vae_bench \
+	h3_dit_bench h3_dit_bench_864 h3_attn_tiled_bench h3_sparse_attn_test \
+	h3_sparse_attn_check vae_bench \
 	libh3.a *.o *.d tests/*.o tests/*.d tools/*.o tools/*.d
