@@ -537,6 +537,8 @@ int h3_gpu_attention_sparse_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                                  float tau);
 /* Query rows per routing unit (one attention threadgroup). */
 uint32_t h3_gpu_sparse_attention_tile_rows(void);
+/* Bench only: bit i runs stage i (summaries, key stats, route, attention). */
+void h3_gpu_sparse_attention_set_stages(unsigned mask);
 /* After h3_gpu_submit: copy the last sparse call's fp32 summaries
  * ([q mean, k mean, v sum][head][block][128] then [head][k mean, k var][128]),
  * route lists ([head][tile][blocks] u16, routed first) and routed counts
