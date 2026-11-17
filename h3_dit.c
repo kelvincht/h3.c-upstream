@@ -115,6 +115,7 @@ struct h3_dit {
     const char *attention_capture_dir;
     uint64_t attention_capture_blocks;
     uint64_t attention_capture_steps;
+    uint64_t qk_int8_skip_blocks;
     float spatial_rope_scale;
     int bf16_final;
     unsigned core_reuse_interval;
@@ -546,6 +547,14 @@ static int configure_sparse_attention(h3_dit *dit, char *error,
                          &dit->attention_capture_blocks, error, error_size) ||
          !env_index_mask("H3_ATTN_CAPTURE_STEPS",
                          &dit->attention_capture_steps, error, error_size)))
+        return 0;
+    /* H3_SOL_QK_INT8_SKIP_BLOCKS: DiT blocks kept on the bf16 sparse kernel
+     * under H3_SOL_QK_INT8=1 (heads whose outlier channels int8 cannot hold). */
+    const char *skip = getenv("H3_SOL_QK_INT8_SKIP_BLOCKS");
+    dit->qk_int8_skip_blocks = 0;
+    if (skip && *skip &&
+        !env_index_mask("H3_SOL_QK_INT8_SKIP_BLOCKS",
+                        &dit->qk_int8_skip_blocks, error, error_size))
         return 0;
     if (!enabled || !*enabled || !strcmp(enabled, "0")) return 1;
     if (strcmp(enabled, "1")) {
@@ -2576,7 +2585,11 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     if (!capture_attention_inputs(dit, index, step, rows, error, error_size))
         return 0;
     const char *tiled_attention = getenv("H3_ATTN_TILED");
-    if (sparse_attention_step(dit, step, rows))
+    const int sparse = sparse_attention_step(dit, step, rows);
+    if (sparse)
+        h3_gpu_set_sparse_qk_int8_skip(
+            dit->gpu, index < 64 && (dit->qk_int8_skip_blocks >> index & 1u));
+    if (sparse)
         OP(h3_gpu_attention_sparse_bf16(
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM),
