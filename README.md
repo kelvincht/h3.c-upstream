@@ -676,6 +676,12 @@ dumps Q/K/V for `h3_sparse_attn_check`; `h3_sparse_attn_test` checks the
 kernel against the dense kernel and a CPU reference;
 `tools/parity_renders.sh` compares two binaries' renders per profile.
 
+`H3_SOL_QK_INT8=1` computes the sparse-path QKᵀ in int8 (per-block scales, K
+mean-smoothing, int32 accumulation); softmax and PV stay full precision.
+`H3_SOL_QK_INT8_SKIP_BLOCKS` takes a comma-separated list of DiT blocks to keep
+in bf16; the lms08 fold sets it to `49`, which has an outlier channel. The
+render log prints `h3: sol int8 QK on, bf16 blocks mask=0x...` at start.
+
 ### Specialized projection kernels
 
 The narrow DiT audio/video output heads convert their small released F32
