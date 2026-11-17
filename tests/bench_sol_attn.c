@@ -6,8 +6,8 @@
  *
  *   ./h3_sol_attn_bench [--reps N] [--sink S] PREFIX ROWS...
  *
- * H3_SOL_VARIANT selects the sparse kernel variant; the output hash is
- * printed so variants can be compared for byte identity. */
+ * The output hash is printed so kernel changes can be checked for byte
+ * identity. */
 #include "h3_gpu.h"
 
 #include <math.h>
@@ -103,9 +103,8 @@ int main(int argc, char **argv) {
     char error[1024];
     h3_gpu *gpu = h3_gpu_create("h3_shaders.metal", error, sizeof(error));
     if (!gpu) { fprintf(stderr, "h3_sol_attn_bench: %s\n", error); return 1; }
-    const char *variant = getenv("H3_SOL_VARIANT");
-    printf("capture=%s cap_rows=%u cap_heads=%u variant=%s sink=%u\n", prefix,
-           cap_rows, cap_heads, variant ? variant : "0", sink);
+    printf("capture=%s cap_rows=%u cap_heads=%u sink=%u\n", prefix, cap_rows,
+           cap_heads, sink);
 
     for (int arg = first + 1; arg < argc; arg++) {
         uint32_t rows = (uint32_t)strtoul(argv[arg], NULL, 10);
@@ -149,14 +148,16 @@ int main(int argc, char **argv) {
         }
         double density = routed / ((double)HEADS * tiles * blocks);
         /* Exact keys: 64 per routed block; virtual keys padded to BK tiles. */
-        double exact_flops = 4.0 * tile_rows * routed * BLOCK * D;
-        double virtual_flops = 4.0 * tile_rows * virtual_keys * D;
-        double dense_flops = 4.0 * (double)rows * rows * HEADS * D;
+        double exact_flops = 4.0 * tile_rows * routed * (double)BLOCK * (double)D;
+        double virtual_flops = 4.0 * tile_rows * virtual_keys * (double)D;
+        double dense_flops = 4.0 * (double)rows * rows * (double)HEADS * (double)D;
         /* Bytes per attention threadgroup: Q + O tiles, routed K/V, fp32
          * virtual key means and value sums. */
-        double flash_bytes = (double)HEADS * tiles * tile_rows * D * 2 * 2 +
-                             routed * BLOCK * D * 2 * 2 + virtual_keys * D * 4 * 2;
-        double qkv_bytes = 3.0 * count * 2;
+        double flash_bytes =
+            (double)HEADS * tiles * tile_rows * (double)D * 2 * 2 +
+            routed * (double)BLOCK * (double)D * 2 * 2 +
+            virtual_keys * (double)D * 4 * 2;
+        double qkv_bytes = 3.0 * (double)count * 2;
 
         static const struct { unsigned mask; const char *name; } stages[] = {
             {0xF, "total"}, {0x1, "summaries"}, {0x2, "key_stats"},

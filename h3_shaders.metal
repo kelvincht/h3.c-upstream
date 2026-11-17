@@ -4423,9 +4423,8 @@ constexpr inline int h3_attn_row_slot(int element, int width) {
 /* One (query group, key block) step: S = Q K^T, online-softmax update of the
  * fp32 running max m / partial sum l, O = alpha O + P V. valid < BK masks the
  * final partial key block. */
-template <int RQ, int BK, bool RELAX, bool SKIP_UNIT_RESCALE = false,
-          typename QOperand, typename KSlice, typename VSlice,
-          typename Accumulator>
+template <int RQ, int BK, bool RELAX, typename QOperand, typename KSlice,
+          typename VSlice, typename Accumulator>
 inline void h3_attn_tiled_step(thread QOperand &q, thread KSlice &ks,
                                thread VSlice &vs, thread Accumulator &acc,
                                thread float *m, thread float *l, float c,
@@ -4469,19 +4468,9 @@ inline void h3_attn_tiled_step(thread QOperand &q, thread KSlice &ks,
         l[s] += p;
         probs[i] = (bfloat)p;
     }
-    /* alpha is exactly 1 when no row max moved, so skipping the multiply
-     * leaves acc bit-identical. */
-    bool rescale = !SKIP_UNIT_RESCALE;
-    if (SKIP_UNIT_RESCALE) {
-        #pragma clang loop unroll(full)
-        for (int s = 0; s < SLOTS; s++) rescale |= alpha[s] != 1.0f;
-        rescale = simd_any(rescale);
-    }
-    if (rescale) {
-        #pragma clang loop unroll(full)
-        for (ushort i = 0; i < acc.get_capacity(); i++)
-            acc[i] *= alpha[h3_attn_row_slot(i, D)];
-    }
+    #pragma clang loop unroll(full)
+    for (ushort i = 0; i < acc.get_capacity(); i++)
+        acc[i] *= alpha[h3_attn_row_slot(i, D)];
     auto left = pv.template get_left_input_cooperative_tensor<
         bfloat, bfloat, float>(probs);
     pv.run(left, vs, acc);
@@ -5002,68 +4991,8 @@ struct h3_attn_sparse_args {
     uint skipped_tail_tiles;  /* empty BK tiles of the partial last block */
 };
 
-/* Stage key tile t of the routed walk into threadgroup memory: unrouted
- * blocks first as virtual keys (key mean, value sum), then routed blocks
- * exactly. Returns the number of valid keys in the tile. */
-template <int NSG, int BK>
-inline int h3_sol_stage_tile(int t, threadgroup bfloat *k_tile,
-                             threadgroup bfloat *v_tile,
-                             device const ushort *list,
-                             device const float *key_means,
-                             device const float *value_sums,
-                             device const bfloat *kh, device const bfloat *vh,
-                             int routed, int unrouted, int virtual_tiles,
-                             int sequence, uint in_row_stride, ushort tid) {
-    constexpr int D = 128;
-    constexpr int THREADS = NSG * 32;
-    constexpr int VECTORS = BK * D / 8;
-    constexpr int HALVES = 64 / BK;
-    int valid;
-    if (t < virtual_tiles) {
-        const int first = routed + t * BK;
-        valid = min(BK, unrouted - t * BK);
-        for (int vector = tid; vector < VECTORS; vector += THREADS) {
-            const int row = vector / (D / 8);
-            const int column = (vector % (D / 8)) * 8;
-            float4 k_lo = 0.0f, k_hi = 0.0f, v_lo = 0.0f, v_hi = 0.0f;
-            if (row < valid) {
-                const ulong offset = (ulong)list[first + row] * D + column;
-                k_lo = *(device const float4 *)(key_means + offset);
-                k_hi = *(device const float4 *)(key_means + offset + 4);
-                v_lo = *(device const float4 *)(value_sums + offset);
-                v_hi = *(device const float4 *)(value_sums + offset + 4);
-            }
-            threadgroup bfloat *kd = k_tile + row * D + column;
-            threadgroup bfloat *vd = v_tile + row * D + column;
-            *(threadgroup bfloat4 *)kd = bfloat4(k_lo);
-            *(threadgroup bfloat4 *)(kd + 4) = bfloat4(k_hi);
-            *(threadgroup bfloat4 *)vd = bfloat4(v_lo);
-            *(threadgroup bfloat4 *)(vd + 4) = bfloat4(v_hi);
-        }
-    } else {
-        const int exact = t - virtual_tiles;
-        const int k0 = (int)list[exact / HALVES] * 64 + (exact % HALVES) * BK;
-        valid = min(BK, sequence - k0);
-        for (int vector = tid; vector < VECTORS; vector += THREADS) {
-            const int row = vector / (D / 8);
-            const int column = (vector % (D / 8)) * 8;
-            uint4 kv = 0, vv = 0;
-            if (row < valid) {
-                const ulong offset = (ulong)(k0 + row) * in_row_stride + column;
-                kv = *(device const uint4 *)(kh + offset);
-                vv = *(device const uint4 *)(vh + offset);
-            }
-            *(threadgroup uint4 *)(k_tile + row * D + column) = kv;
-            *(threadgroup uint4 *)(v_tile + row * D + column) = vv;
-        }
-    }
-    return valid;
-}
-
-/* The staged tgq kernel with Q in registers, walking a routed key list.
- * PIPE double-buffers the K/V tiles: tile t+1 is staged while tile t is
- * computed, with one barrier per tile; the accumulation order is unchanged. */
-template <int RQ, int NSG, int BK, bool PIPE, bool LAZY>
+/* The staged tgq kernel with Q in registers, walking a routed key list. */
+template <int RQ, int NSG, int BK>
 kernel void h3_attn_sparse_bf16_impl(
                            device bfloat *query [[buffer(0)]],
                            device bfloat *key [[buffer(1)]],
@@ -5079,10 +5008,11 @@ kernel void h3_attn_sparse_bf16_impl(
                            ushort lane [[thread_index_in_simdgroup]]) {
     constexpr int D = 128;
     constexpr int SLOTS = RQ / 8;
+    constexpr int THREADS = NSG * 32;
+    constexpr int VECTORS = BK * D / 8;
     constexpr int HALVES = 64 / BK;
-    constexpr int BUFFERS = PIPE ? 2 : 1;
-    threadgroup bfloat k_tile[BUFFERS * BK * D];
-    threadgroup bfloat v_tile[BUFFERS * BK * D];
+    threadgroup bfloat k_tile[BK * D];
+    threadgroup bfloat v_tile[BK * D];
     const int sequence = (int)args.sequence;
     const int q0 = (int)group.x * (RQ * NSG) + (int)simdgroup * RQ;
     const ulong in_head = (ulong)group.y * args.in_head_stride;
@@ -5130,34 +5060,52 @@ kernel void h3_attn_sparse_bf16_impl(
     #pragma clang loop unroll(full)
     for (int s = 0; s < SLOTS; s++) { m[s] = -1.0e30f; l[s] = 0.0f; }
 
-    int staged = 0;
-    if (PIPE && tiles > 0)
-        staged = h3_sol_stage_tile<NSG, BK>(
-            0, k_tile, v_tile, list, key_means, value_sums, kh, vh, routed,
-            unrouted, virtual_tiles, sequence, args.in_row_stride, tid);
     for (int t = 0; t < tiles; t++) {
         int valid;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        const int buffer = PIPE ? (t & 1) * BK * D : 0;
-        if (PIPE) {
-            valid = staged;
-            if (t + 1 < tiles) {
-                const int next = ((t + 1) & 1) * BK * D;
-                staged = h3_sol_stage_tile<NSG, BK>(
-                    t + 1, k_tile + next, v_tile + next, list, key_means,
-                    value_sums, kh, vh, routed, unrouted, virtual_tiles,
-                    sequence, args.in_row_stride, tid);
+        if (t < virtual_tiles) {
+            /* Unrouted blocks as virtual keys: key mean, value sum. */
+            const int first = routed + t * BK;
+            valid = min(BK, unrouted - t * BK);
+            for (int vector = tid; vector < VECTORS; vector += THREADS) {
+                const int row = vector / (D / 8);
+                const int column = (vector % (D / 8)) * 8;
+                float4 k_lo = 0.0f, k_hi = 0.0f, v_lo = 0.0f, v_hi = 0.0f;
+                if (row < valid) {
+                    const ulong offset = (ulong)list[first + row] * D + column;
+                    k_lo = *(device const float4 *)(key_means + offset);
+                    k_hi = *(device const float4 *)(key_means + offset + 4);
+                    v_lo = *(device const float4 *)(value_sums + offset);
+                    v_hi = *(device const float4 *)(value_sums + offset + 4);
+                }
+                threadgroup bfloat *kd = k_tile + row * D + column;
+                threadgroup bfloat *vd = v_tile + row * D + column;
+                *(threadgroup bfloat4 *)kd = bfloat4(k_lo);
+                *(threadgroup bfloat4 *)(kd + 4) = bfloat4(k_hi);
+                *(threadgroup bfloat4 *)vd = bfloat4(v_lo);
+                *(threadgroup bfloat4 *)(vd + 4) = bfloat4(v_hi);
             }
         } else {
-            valid = h3_sol_stage_tile<NSG, BK>(
-                t, k_tile, v_tile, list, key_means, value_sums, kh, vh, routed,
-                unrouted, virtual_tiles, sequence, args.in_row_stride, tid);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const int exact = t - virtual_tiles;
+            const int k0 = (int)list[exact / HALVES] * 64 +
+                           (exact % HALVES) * BK;
+            valid = min(BK, sequence - k0);
+            for (int vector = tid; vector < VECTORS; vector += THREADS) {
+                const int row = vector / (D / 8);
+                const int column = (vector % (D / 8)) * 8;
+                uint4 kv = 0, vv = 0;
+                if (row < valid) {
+                    const ulong offset = (ulong)(k0 + row) * args.in_row_stride +
+                                         column;
+                    kv = *(device const uint4 *)(kh + offset);
+                    vv = *(device const uint4 *)(vh + offset);
+                }
+                *(threadgroup uint4 *)(k_tile + row * D + column) = kv;
+                *(threadgroup uint4 *)(v_tile + row * D + column) = vv;
+            }
         }
-        auto kcur = tensor(k_tile + buffer, dextents<int32_t, 2>(D, BK));
-        auto vcur = tensor(v_tile + buffer, dextents<int32_t, 2>(D, BK));
-        h3_attn_tiled_step<RQ, BK, false, LAZY>(qreg, kcur, vcur, acc, m, l, c,
-                                               valid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        h3_attn_tiled_step<RQ, BK, false>(qreg, kts, vts, acc, m, l, c, valid);
         /* Every unrouted block holds 64 tokens: weight its virtual key's
          * denominator mass by 64 (the value sums already carry it). */
         if (t + 1 == virtual_tiles) {
@@ -5183,12 +5131,7 @@ kernel void h3_attn_sparse_bf16_impl(
     result.store(os);
 }
 
-typedef decltype(h3_attn_sparse_bf16_impl<16, 8, 32, false, false>)
-    h3_attn_sparse_bf16_t;
-#define H3_ATTN_SPARSE_INSTANCE(NAME, RQ, NSG, BK, PIPE, LAZY) \
-    template [[host_name(NAME)]] kernel h3_attn_sparse_bf16_t \
-        h3_attn_sparse_bf16_impl<RQ, NSG, BK, PIPE, LAZY>;
-H3_ATTN_SPARSE_INSTANCE("h3_attn_sparse_bf16_r16s8k32", 16, 8, 32, false, false)
-H3_ATTN_SPARSE_INSTANCE("h3_attn_sparse_bf16_r16s8k32_lazy", 16, 8, 32, false, true)
-H3_ATTN_SPARSE_INSTANCE("h3_attn_sparse_bf16_r16s8k32_pipe_lazy", 16, 8, 32, true, true)
+typedef decltype(h3_attn_sparse_bf16_impl<16, 8, 32>) h3_attn_sparse_bf16_t;
+template [[host_name("h3_attn_sparse_bf16_r16s8k32")]]
+kernel h3_attn_sparse_bf16_t h3_attn_sparse_bf16_impl<16, 8, 32>;
 #endif
