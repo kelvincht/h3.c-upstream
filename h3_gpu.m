@@ -3290,6 +3290,15 @@ int h3_gpu_quantize_weight_int8(h3_gpu *opaque, h3_gpu_tensor *output,
         1.0f, @"BF16 weight to quantize");
 }
 
+/* H3_INT8_MM_VARIANT selects byte-identical int8 matmul schedules for A/B
+ * without a rebuild: 0 current, 1 full-K attention output and 1024-deep FC2
+ * groups, 2 adds the 128x128 FC2 tile, 3 adds the full-K register-gate FC1. */
+static int h3_int8_mm_variant(void) {
+    const char *value = getenv("H3_INT8_MM_VARIANT");
+    int variant = value ? atoi(value) : 0;
+    return variant < 0 ? 0 : variant > 3 ? 3 : variant;
+}
+
 static int h3_gpu_linear_int8_bf16_layout(
                             h3_gpu *opaque, h3_gpu_tensor *output,
                             h3_gpu_tensor *quantized_input,
@@ -3327,8 +3336,12 @@ static int h3_gpu_linear_int8_bf16_layout(
     BOOL known_linear = local_scales && rows <= 2048 && input_dim == 7168 &&
         output_dim == 5376 &&
         getenv("H3_DISABLE_INT8_LINEAR_KNOWN") == NULL;
+    BOOL full_k_linear = local_scales && !known_linear &&
+        input_dim == 7168 && output_dim == 5376 && h3_int8_mm_variant() >= 1;
     id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
-        gpu, known_linear ? @"h3_linear_int8_local_scales_nax_r128_k7168" :
+        gpu, full_k_linear ?
+             @"h3_linear_int8_local_scales_nax_r128_full_k7168" :
+             known_linear ? @"h3_linear_int8_local_scales_nax_r128_k7168" :
              local_scales ? @"h3_linear_int8_local_scales_nax_r128" :
                             @"h3_linear_int8_nax_r128");
     if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
@@ -3415,6 +3428,12 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                                strcmp(stage, "bf16"));
     BOOL int8_fc2 = !stage || (strcmp(stage, "fc1") &&
                                strcmp(stage, "bf16"));
+    /* Benchmark-only: time FC1 (a), the FC2 input quantizer (q) and FC2 (b)
+     * separately; a skipped int8 part leaves its output as last written. */
+    const char *parts = getenv("H3_BENCH_INT8_MLP_PARTS");
+    BOOL run_fc1 = !parts || strchr(parts, 'a') != NULL;
+    BOOL run_quant = !parts || strchr(parts, 'q') != NULL;
+    BOOL run_fc2 = !parts || strchr(parts, 'b') != NULL;
     if (!gpu.tensorOpsEnabled || rows < 128 || rows > UINT32_MAX - 127u ||
         (input_dim % 128) || (hidden_dim % 128) || (output_dim % 128) ||
         !h3_gpu_require_i8(gpu, quantized_activation, activation_capacity,
@@ -3469,6 +3488,21 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         gpu, @"h3_linear_int8_grouped_local_nax_r128x64");
     id<MTLComputePipelineState> fc2_grouped_local128 = h3_gpu_pipeline(
         gpu, @"h3_linear_int8_grouped_local_nax_r128x128");
+    int mm_variant = h3_int8_mm_variant();
+    id<MTLComputePipelineState> fc1_local_full = mm_variant >= 3 ?
+        h3_gpu_pipeline(gpu, @"h3_fc1_swiglu_int8_local_nax_r128_full_k5376") :
+        nil;
+    id<MTLComputePipelineState> fc2_grouped_variant = mm_variant >= 1 ?
+        h3_gpu_pipeline(gpu, mm_variant >= 2 ?
+            @"h3_linear_int8_grouped_local_nax_r128x128_k1024" :
+            @"h3_linear_int8_grouped_local_nax_r128x64_k1024") : nil;
+    if ((mm_variant >= 3 && (!fc1_local_full ||
+         fc1_local_full.maxTotalThreadsPerThreadgroup < 256)) ||
+        (mm_variant >= 1 && (!fc2_grouped_variant ||
+         fc2_grouped_variant.maxTotalThreadsPerThreadgroup < 256))) {
+        h3_gpu_set_error(gpu, @"H3_INT8_MM_VARIANT kernel is unavailable");
+        return 0;
+    }
     if (!fc1 || !fc1_known || !fc1_full || !fc1_local || !fc2 ||
         !fc2_full || !fc2_full_n256 ||
         fc1.maxTotalThreadsPerThreadgroup < 256 ||
@@ -3508,6 +3542,11 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
             strcmp(known_override, "0") != 0;
     BOOL int8_fc1_full = int8_fc1_known &&
         getenv("H3_DISABLE_FC1_FULL_K") == NULL;
+    BOOL variant_fc1 = int8_fc1_full && !int8_fc1_local && mm_variant >= 3;
+    BOOL variant_fc2 = grouped_fc2_local && !grouped_fc2_local128 &&
+        hidden_dim == 14336u && mm_variant >= 1;
+    uint32_t grouped_columns = variant_fc2 && mm_variant >= 2 ? 128u :
+        grouped_fc2 && !grouped_fc2_local128 ? 64u : 128u;
     uint32_t row_tiles = padded_rows / 128;
     if (input_is_quantized && !int8_fc1) {
         h3_gpu_set_error(gpu,
@@ -3519,11 +3558,13 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
             opaque, quantized_activation, activation_scales, input, rows,
             padded_rows, input_dim, activation_clip,
             @"int8 MLP input")) return 0;
-    if (int8_fc1) @autoreleasepool {
+    if (int8_fc1 && !run_fc1) {
+    } else if (int8_fc1) @autoreleasepool {
         linear_args fc1_args = {rows, input_dim, hidden_dim, 0};
         id<MTLComputeCommandEncoder> encoder =
             [gpu.command computeCommandEncoder];
-        [encoder setComputePipelineState:int8_fc1_local ? fc1_local :
+        [encoder setComputePipelineState:variant_fc1 ? fc1_local_full :
+            int8_fc1_local ? fc1_local :
             int8_fc1_full ? fc1_full :
             int8_fc1_known ? fc1_known : fc1];
         [encoder setBuffer:TENSOR(quantized_activation).buffer
@@ -3549,21 +3590,23 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         gpu.stats = stats;
     }
 
-    if (int8_fc2 && grouped_fc2 &&
+    if (int8_fc2 && grouped_fc2 && run_quant &&
         !h3_gpu_quantize_bf16_int8_groups(
             opaque, quantized_activation, activation_scales, activated, rows,
             padded_rows, hidden_dim, 1024,
             use_slower_grouped_quantizer)) return 0;
-    if (int8_fc2 && !grouped_fc2 &&
+    if (int8_fc2 && !grouped_fc2 && run_quant &&
         !h3_gpu_quantize_bf16_int8_rows(
             opaque, quantized_activation, activation_scales, activated, rows,
             padded_rows, hidden_dim, activation_clip,
             @"int8 MLP FC2 input")) return 0;
-    if (int8_fc2) @autoreleasepool {
+    if (int8_fc2 && !run_fc2) {
+    } else if (int8_fc2) @autoreleasepool {
         linear_args fc2_args = {rows, hidden_dim, output_dim, 0};
         id<MTLComputeCommandEncoder> encoder =
             [gpu.command computeCommandEncoder];
-        [encoder setComputePipelineState:grouped_fc2_local128 ?
+        [encoder setComputePipelineState:variant_fc2 ? fc2_grouped_variant :
+            grouped_fc2_local128 ?
             fc2_grouped_local128 : grouped_fc2_local ?
             fc2_grouped_local : grouped_fc2 ? fc2_grouped :
             row_fc2_n256 ? fc2_full_n256 :
@@ -3579,9 +3622,7 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         [encoder dispatchThreadgroups:
             MTLSizeMake((NSUInteger)row_tiles *
                         (output_dim /
-                         (row_fc2_n256 ? 256u :
-                          grouped_fc2 && !grouped_fc2_local128 ?
-                          64u : 128u)), 1, 1)
+                         (row_fc2_n256 ? 256u : grouped_columns)), 1, 1)
                  threadsPerThreadgroup:
                     MTLSizeMake(row_fc2_n256 ? 512u :
                         grouped_fc2_local ? 256u :

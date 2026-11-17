@@ -2276,7 +2276,8 @@ kernel h3_fc1_swiglu_int8_nax_r128_t
 /* Gate and up use the same cooperative-fragment mapping. Preserve the gate's
  * existing BF16 rounding point in thread-private storage, then consume it
  * after the up projection without a 32 KiB threadgroup tile or barrier. */
-kernel void h3_fc1_swiglu_int8_local_nax_r128(
+template<uint INPUT_DIM>
+kernel void h3_fc1_swiglu_int8_local_nax_r128_impl(
                            device int8_t *input [[buffer(0)]],
                            device int8_t *weight [[buffer(1)]],
                            device const float *input_scales [[buffer(2)]],
@@ -2299,22 +2300,28 @@ kernel void h3_fc1_swiglu_int8_local_nax_r128(
     auto w = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
         weight, dextents<int32_t, 2>((int)args.input_dim,
                                      (int)args.output_dim * 2));
+    constexpr bool FULL_PRODUCT = INPUT_DIM != 0;
+    constexpr uint K_TILE = FULL_PRODUCT ? INPUT_DIM : TILE;
     constexpr auto descriptor = matmul2d_descriptor(
-        TILE, TILE, TILE, false, true, true,
-        matmul2d_descriptor::mode::multiply_accumulate);
+        TILE, TILE, K_TILE, false, true, true,
+        FULL_PRODUCT ? matmul2d_descriptor::mode::multiply :
+                       matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<descriptor, execution_simdgroups<8>> mm;
     thread bfloat gate_values[FRAGMENT_CAPACITY];
     {
-        auto first_a = x.slice<TILE, TILE>(0, (int)row_start);
-        auto first_b = w.slice<TILE, TILE>(0, (int)column_start);
+        auto first_a = x.slice<TILE, K_TILE>(0, (int)row_start);
+        auto first_b = w.slice<K_TILE, TILE>(0, (int)column_start);
         auto accum = mm.template get_destination_cooperative_tensor<
             decltype(first_a), decltype(first_b), int32_t>();
-        #pragma clang loop unroll(full)
-        for (ushort element = 0; element < accum.get_capacity(); element++)
-            if (accum.is_valid_element(element)) accum[element] = 0;
-        for (uint k = 0; k < args.input_dim; k += TILE) {
-            auto a = x.slice<TILE, TILE>((int)k, (int)row_start);
-            auto b = w.slice<TILE, TILE>((int)k, (int)column_start);
+        if constexpr (!FULL_PRODUCT) {
+            #pragma clang loop unroll(full)
+            for (ushort element = 0; element < accum.get_capacity(); element++)
+                if (accum.is_valid_element(element)) accum[element] = 0;
+        }
+        for (uint k = 0; k < (FULL_PRODUCT ? INPUT_DIM : args.input_dim);
+             k += K_TILE) {
+            auto a = x.slice<TILE, K_TILE>((int)k, (int)row_start);
+            auto b = w.slice<K_TILE, TILE>((int)k, (int)column_start);
             mm.run(a, b, accum);
         }
         #pragma clang loop unroll(full)
@@ -2329,17 +2336,20 @@ kernel void h3_fc1_swiglu_int8_local_nax_r128(
         }
     }
     {
-        auto first_a = x.slice<TILE, TILE>(0, (int)row_start);
-        auto first_b = w.slice<TILE, TILE>(
+        auto first_a = x.slice<TILE, K_TILE>(0, (int)row_start);
+        auto first_b = w.slice<K_TILE, TILE>(
             0, (int)args.output_dim + (int)column_start);
         auto accum = mm.template get_destination_cooperative_tensor<
             decltype(first_a), decltype(first_b), int32_t>();
-        #pragma clang loop unroll(full)
-        for (ushort element = 0; element < accum.get_capacity(); element++)
-            if (accum.is_valid_element(element)) accum[element] = 0;
-        for (uint k = 0; k < args.input_dim; k += TILE) {
-            auto a = x.slice<TILE, TILE>((int)k, (int)row_start);
-            auto b = w.slice<TILE, TILE>(
+        if constexpr (!FULL_PRODUCT) {
+            #pragma clang loop unroll(full)
+            for (ushort element = 0; element < accum.get_capacity(); element++)
+                if (accum.is_valid_element(element)) accum[element] = 0;
+        }
+        for (uint k = 0; k < (FULL_PRODUCT ? INPUT_DIM : args.input_dim);
+             k += K_TILE) {
+            auto a = x.slice<TILE, K_TILE>((int)k, (int)row_start);
+            auto b = w.slice<K_TILE, TILE>(
                 (int)k, (int)args.output_dim + (int)column_start);
             mm.run(a, b, accum);
         }
@@ -2358,6 +2368,18 @@ kernel void h3_fc1_swiglu_int8_local_nax_r128(
         }
     }
 }
+
+typedef decltype(h3_fc1_swiglu_int8_local_nax_r128_impl<0>)
+    h3_fc1_swiglu_int8_local_nax_r128_t;
+template [[host_name("h3_fc1_swiglu_int8_local_nax_r128")]]
+kernel h3_fc1_swiglu_int8_local_nax_r128_t
+    h3_fc1_swiglu_int8_local_nax_r128_impl<0>;
+/* H3_INT8_MM_VARIANT=3: the full-K FC1 product without the 32 KiB
+ * threadgroup gate tile and its barrier, so more threadgroups fit per core.
+ * The gate keeps its BF16 rounding point, so the output bytes are unchanged. */
+template [[host_name("h3_fc1_swiglu_int8_local_nax_r128_full_k5376")]]
+kernel h3_fc1_swiglu_int8_local_nax_r128_t
+    h3_fc1_swiglu_int8_local_nax_r128_impl<5376>;
 
 kernel void h3_linear_int8_nax_r128(
                            device int8_t *input [[buffer(0)]],
@@ -2524,7 +2546,7 @@ kernel void h3_linear_int8_nax_r128x256_full_k14336(
 
 /* Cache the two 128-value dequantization vectors once per projection tile.
  * The cooperative output fragment otherwise rereads them for every element. */
-template<uint INPUT_DIM, uint OUTPUT_DIM>
+template<uint INPUT_DIM, uint OUTPUT_DIM, uint K_TILE = 128>
 kernel void h3_linear_int8_local_scales_nax_r128_impl(
                            device int8_t *input [[buffer(0)]],
                            device int8_t *weight [[buffer(1)]],
@@ -2557,22 +2579,22 @@ kernel void h3_linear_int8_local_scales_nax_r128_impl(
         weight, dextents<int32_t, 2>((int)input_dim,
                                      (int)output_dim));
     constexpr auto descriptor = matmul2d_descriptor(
-        TILE, TILE, TILE, false, true, true,
+        TILE, TILE, K_TILE, false, true, true,
         matmul2d_descriptor::mode::multiply_accumulate);
     constexpr auto first_descriptor = matmul2d_descriptor(
-        TILE, TILE, TILE, false, true, true,
+        TILE, TILE, K_TILE, false, true, true,
         matmul2d_descriptor::mode::multiply);
     matmul2d<descriptor, execution_simdgroups<8>> mm;
     matmul2d<first_descriptor, execution_simdgroups<8>> first_mm;
-    auto first_a = x.slice<TILE, TILE>(0, (int)row_start);
-    auto first_b = w.slice<TILE, TILE>(0, (int)column_start);
+    auto first_a = x.slice<TILE, K_TILE>(0, (int)row_start);
+    auto first_b = w.slice<K_TILE, TILE>(0, (int)column_start);
     auto accum = mm.template get_destination_cooperative_tensor<
         decltype(first_a), decltype(first_b), int32_t>();
     first_mm.run(first_a, first_b, accum);
     if (INPUT_DIM) {
-        for (uint k = TILE; k < INPUT_DIM; k += TILE) {
-            auto a = x.slice<TILE, TILE>((int)k, (int)row_start);
-            auto b = w.slice<TILE, TILE>((int)k, (int)column_start);
+        for (uint k = K_TILE; k < INPUT_DIM; k += K_TILE) {
+            auto a = x.slice<TILE, K_TILE>((int)k, (int)row_start);
+            auto b = w.slice<K_TILE, TILE>((int)k, (int)column_start);
             mm.run(a, b, accum);
         }
     } else {
@@ -2604,6 +2626,12 @@ kernel h3_linear_int8_local_scales_nax_r128_t
 template [[host_name("h3_linear_int8_local_scales_nax_r128_k7168")]]
 kernel h3_linear_int8_local_scales_nax_r128_t
     h3_linear_int8_local_scales_nax_r128_impl<7168, 5376>;
+/* H3_INT8_MM_VARIANT>=1: attention output as one 7168-deep TensorOps product,
+ * the same widening FC1 and QKV received. int32 sums are exact, so the output
+ * bytes match the 128-deep loop. */
+template [[host_name("h3_linear_int8_local_scales_nax_r128_full_k7168")]]
+kernel h3_linear_int8_local_scales_nax_r128_t
+    h3_linear_int8_local_scales_nax_r128_impl<7168, 5376, 7168>;
 
 /* FC2 is more sensitive to a single scale spanning all 14336 activated
  * channels.  Retain one activation scale per 1024-wide K group, accumulate
@@ -2690,7 +2718,8 @@ kernel void h3_linear_int8_grouped_nax_r128x64(
  * cooperative tensor assigns the same fragment element to the same thread
  * for every K slice. Keep those 64 FP32 totals private and issue two
  * 512-wide scale-group products before draining either fragment. */
-kernel void h3_linear_int8_grouped_local_nax_r128x64(
+template<uint COLUMN_TILE, uint K_TILE>
+kernel void h3_linear_int8_grouped_local_nax_impl(
                            device int8_t *input [[buffer(0)]],
                            device int8_t *weight [[buffer(1)]],
                            device const float *input_scales [[buffer(2)]],
@@ -2700,8 +2729,6 @@ kernel void h3_linear_int8_grouped_local_nax_r128x64(
                            uint code [[threadgroup_position_in_grid]],
                            ushort tid [[thread_index_in_threadgroup]]) {
     constexpr uint ROW_TILE = 128;
-    constexpr uint COLUMN_TILE = 64;
-    constexpr uint K_TILE = 512;
     constexpr uint SCALE_GROUP = 1024;
     constexpr uint K_TILES_PER_GROUP = SCALE_GROUP / K_TILE;
     constexpr uint SCALE_GROUPS = 14;
@@ -2805,6 +2832,22 @@ kernel void h3_linear_int8_grouped_local_nax_r128x64(
         }
     }
 }
+
+typedef decltype(h3_linear_int8_grouped_local_nax_impl<64, 512>)
+    h3_linear_int8_grouped_local_nax_t;
+template [[host_name("h3_linear_int8_grouped_local_nax_r128x64")]]
+kernel h3_linear_int8_grouped_local_nax_t
+    h3_linear_int8_grouped_local_nax_impl<64, 512>;
+/* H3_INT8_MM_VARIANT=1: one TensorOps product per 1024-wide scale group.
+ * H3_INT8_MM_VARIANT>=2: also a 128x128 output tile, doubling operand reuse.
+ * Each element still sums the same exact int32 group products in the same
+ * order with the same FP32 epilogue, so the output bytes are unchanged. */
+template [[host_name("h3_linear_int8_grouped_local_nax_r128x64_k1024")]]
+kernel h3_linear_int8_grouped_local_nax_t
+    h3_linear_int8_grouped_local_nax_impl<64, 1024>;
+template [[host_name("h3_linear_int8_grouped_local_nax_r128x128_k1024")]]
+kernel h3_linear_int8_grouped_local_nax_t
+    h3_linear_int8_grouped_local_nax_impl<128, 1024>;
 
 /* Wider-output form: the doubled tile uses eight SIMD groups, so each thread
  * still owns 64 output elements while the grid launches half as many FC2
