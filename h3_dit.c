@@ -556,6 +556,10 @@ static int configure_sparse_attention(h3_dit *dit, char *error,
         !env_index_mask("H3_SOL_QK_INT8_SKIP_BLOCKS",
                         &dit->qk_int8_skip_blocks, error, error_size))
         return 0;
+    const char *qk_int8 = getenv("H3_SOL_QK_INT8");
+    if (qk_int8 && !strcmp(qk_int8, "1"))
+        fprintf(stderr, "h3: sol int8 QK on, bf16 blocks mask=0x%llx\n",
+                (unsigned long long)dit->qk_int8_skip_blocks);
     if (!enabled || !*enabled || !strcmp(enabled, "0")) return 1;
     if (strcmp(enabled, "1")) {
         fail(error, error_size, "H3_SPARSE_ATTN must be 0 or 1");
